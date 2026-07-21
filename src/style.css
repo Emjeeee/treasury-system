@@ -19,9 +19,36 @@
   --amber-s: #fbf2e3;
   --purple: #7a5af8;
   --purple-s: #f1eefe;
+  --ink: #1a1a18;
   --hdr: 56px;
   --nav: 66px;
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+:root[data-theme="dark"] {
+  --bg: #16171a;
+  --card: #1e2023;
+  --line: #303338;
+  --line2: #292b2f;
+  --hov: #26282c;
+  --tx: #f0efec;
+  --tx2: #a3a39d;
+  --tx3: #77776f;
+  --blue: #4c8dff;
+  --blue-d: #6ba3ff;
+  --blue-s: #17263f;
+  --green: #34c17a;
+  --green-d: #4bd48c;
+  --green-s: #123321;
+  --red: #ff6b6b;
+  --red-s: #3a1717;
+  --amber: #e0a83c;
+  --amber-s: #392b0d;
+  --purple: #a690ff;
+  --purple-s: #241f3e;
+  --ink: #2c2e32;
+}
+:root[data-theme="dark"] .modal {
+  background: rgba(0, 0, 0, 0.6);
 }
 * {
   box-sizing: border-box;
@@ -222,6 +249,14 @@ header .wrap {
 .btn.wide {
   width: 100%;
 }
+.btn.icon {
+  padding: 0;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  display: grid;
+  place-items: center;
+}
 input,
 select,
 textarea {
@@ -418,7 +453,12 @@ nav button.on .dot {
   border-radius: 9px;
   padding: 3px;
   gap: 2px;
-  flex-wrap: wrap;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.seg::-webkit-scrollbar {
+  display: none;
 }
 .seg button {
   border: 0;
@@ -427,6 +467,8 @@ nav button.on .dot {
   border-radius: 7px;
   font-size: 14px;
   font-weight: 600;
+  white-space: nowrap;
+  flex: none;
   color: var(--tx2);
   cursor: pointer;
   transition: all 0.18s;
@@ -460,9 +502,9 @@ nav button.on .dot {
   color: var(--tx);
 }
 .chip.on {
-  background: var(--tx);
+  background: var(--ink);
   color: #fff;
-  border-color: var(--tx);
+  border-color: var(--ink);
 }
 .empty {
   text-align: center;
@@ -504,7 +546,7 @@ nav button.on .dot {
   position: fixed;
   bottom: calc(var(--nav) + 16px);
   left: 50%;
-  background: var(--tx);
+  background: var(--ink);
   color: #fff;
   padding: 12px 20px;
   border-radius: 11px;
@@ -513,6 +555,7 @@ nav button.on .dot {
   z-index: 60;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
   animation: tin 0.25s var(--ease);
+  animation-fill-mode: forwards;
 }
 @keyframes tin {
   from {
@@ -565,6 +608,20 @@ nav button.on .dot {
 .drop.over {
   border-color: var(--blue);
   background: var(--blue-s);
+}
+.proof-prev img {
+  max-height: 120px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  display: block;
+  cursor: pointer;
+}
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+th.sortable:hover {
+  color: var(--tx);
 }
 .auth {
   min-height: 100dvh;
@@ -641,6 +698,117 @@ nav button.on .dot {
   flex: 1;
   height: 1px;
   background: var(--line);
+}
+.pw {
+  position: relative;
+}
+.pw input {
+  padding-right: 44px;
+}
+.pw .eye {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 8px;
+  color: var(--tx2);
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+.pw .eye:hover {
+  color: var(--tx);
+  background: var(--hov);
+}
+input[readonly] {
+  background: var(--line2);
+  color: var(--tx2);
+  cursor: default;
+}
+input[readonly]:hover {
+  border-color: var(--line);
+}
+.xls-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.stepper {
+  display: flex;
+  align-items: stretch;
+}
+.stepper input {
+  text-align: center;
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.stepper input::-webkit-outer-spin-button,
+.stepper input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.step-btn {
+  flex: none;
+  width: 44px;
+  border: 1.5px solid var(--line);
+  background: var(--card);
+  font-size: 20px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--tx);
+  transition: background 0.15s;
+}
+.step-btn:hover {
+  background: var(--hov);
+}
+.step-btn:first-child {
+  border-radius: 9px 0 0 9px;
+}
+.step-btn:last-child {
+  border-radius: 0 9px 9px 0;
+}
+.amt-field input::-webkit-outer-spin-button,
+.amt-field input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.amt-field input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.filepick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+@media (max-width: 640px) {
+  header .wrap {
+    gap: 6px;
+    padding: 0 10px;
+  }
+  .xls-label {
+    display: none;
+  }
+  .xls-btn {
+    padding: 8px;
+    width: 34px;
+    justify-content: center;
+  }
+  .seg button {
+    padding: 7px 10px;
+    font-size: 13px;
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   * {

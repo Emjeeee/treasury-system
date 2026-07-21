@@ -1,6 +1,13 @@
-import './style.css'
-import * as XLSX from 'xlsx'
-import Chart from 'chart.js/auto'
+import "./style.css";
+import "./storage.js";
+import * as XLSX from "xlsx";
+import Chart from "chart.js/auto";
+
+let _ExcelJS = null;
+async function loadExcelJS() {
+  if (!_ExcelJS) _ExcelJS = (await import("exceljs")).default;
+  return _ExcelJS;
+}
 
 /* ================= penyimpanan ================= */
 const SKEY = "ct_shared_v4",
@@ -16,16 +23,18 @@ let S = {
     ],
     banks: ["BCA", "Livin Mandiri", "BRI", "Tunai"],
     tpl: [
-      { f: "date", h: "Tanggal" },
-      { f: "type", h: "Jenis" },
+      { f: "no", h: "No" },
       { f: "name", h: "Nama" },
-      { f: "phone", h: "WhatsApp" },
+      { f: "phone", h: "No. WhatsApp" },
+      { f: "type", h: "Jenis" },
       { f: "cat", h: "Kategori" },
-      { f: "seats", h: "Kursi" },
-      { f: "amount", h: "Nominal" },
+      { f: "seats", h: "Jumlah Kursi" },
+      { f: "debit", h: "Debit (Rp)" },
+      { f: "credit", h: "Kredit (Rp)" },
       { f: "bank", h: "Rekening" },
       { f: "status", h: "Status" },
       { f: "note", h: "Catatan" },
+      { f: "date", h: "Tanggal" },
     ],
   },
   tx: [],
@@ -35,7 +44,8 @@ let S = {
 };
 let me = null,
   imp = null,
-  lang = "id";
+  lang = "id",
+  theme = "light";
 let screen = "boot",
   tab = "dash",
   filter = "all",
@@ -44,7 +54,10 @@ let screen = "boot",
   authMode = "in";
 let chart1 = null,
   pendingImp = [],
-  logQ = "";
+  logQ = "",
+  txQ = "",
+  txSort = { k: "date", dir: "desc" },
+  exportKind = "week";
 
 const D = () => S.config;
 const rp = (n) => "Rp " + (Math.round(n) || 0).toLocaleString("id-ID");
@@ -88,7 +101,9 @@ async function pull() {
         return true;
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error("pull() failed:", e);
+  }
   return false;
 }
 async function push() {
@@ -96,6 +111,7 @@ async function push() {
   try {
     await window.storage.set(SKEY, JSON.stringify(S), true);
   } catch (e) {
+    console.error("push() failed:", e);
     toast("⚠ " + t("saveErr"));
   }
 }
@@ -103,7 +119,9 @@ async function mutate(fn, logAct, logDet) {
   try {
     const r = await window.storage.get(SKEY, true);
     if (r && r.value) S = Object.assign(S, JSON.parse(r.value));
-  } catch (e) {}
+  } catch (e) {
+    console.error("mutate() pre-fetch failed:", e);
+  }
   fn();
   if (logAct) {
     S.logs.unshift({
@@ -127,11 +145,17 @@ async function saveSession() {
         email: me ? me.email : "",
         imp: imp ? imp.email : "",
         lang,
+        theme,
       }),
       false,
     );
   } catch (e) {}
 }
+const closeIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
+const closeBtn = () =>
+  `<button type="button" class="btn ghost sm icon" onclick="closeSheet()" aria-label="${t("close")}" title="${t("close")}">${closeIcon}</button>`;
+const proofIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 16l-5-4-4 3-3-2-6 5"/></svg>`;
+const downloadIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>`;
 function toast(m) {
   const e = document.createElement("div");
   e.className = "toast";
@@ -197,6 +221,15 @@ const L = {
     amtIn: "Nominal transfer",
     amtOut: "Nominal pengeluaran",
     note: "Catatan bukti transfer",
+    proof: "Bukti transfer (gambar)",
+    proofBig: "Ukuran gambar maksimal 8 MB",
+    proofHint: "Foto otomatis dikecilkan agar hemat penyimpanan",
+    chooseFile: "Pilih berkas",
+    noFileChosen: "Tidak ada berkas dipilih",
+    fileAttached: "Gambar terpasang",
+    viewProof: "Lihat bukti",
+    destAcc: "No. rekening tujuan",
+    searchTx: "Cari nama, telepon, catatan, rekening...",
     status: "Status uang",
     stW: "Menunggu cek mutasi",
     stV: "Sudah masuk rekening",
@@ -252,8 +285,8 @@ const L = {
     forgot: "Lupa kata sandi?",
     haveAcc: "Sudah punya akun? Masuk",
     noAcc: "Belum punya akun? Daftar",
-    welcome: "Masuk ke Kas Acara",
-    welcomeSub: "Catat pemasukan, donasi, dan pengeluaran acara.",
+    welcome: "Treasury System",
+    welcomeSub: "Sistem pencatatan keuangan acara.",
     setupT: "Buat akun admin pertama",
     setupSub: "Akun ini mengelola pengaturan, pengguna, dan log aktivitas.",
     createAdmin: "Buat akun admin",
@@ -319,6 +352,16 @@ const L = {
     gGo: "Lanjutkan",
     byAdmin: "oleh admin {n}",
     bulk: "Aksi massal",
+    themeToggle: "Ganti tema terang/gelap",
+    copyright: "Hak cipta dilindungi.",
+    customCol: "Kustom",
+    addCol: "+ Tambah kolom kustom",
+    customFields: "Kolom tambahan",
+    perWeek: "Mingguan",
+    perMonth: "Bulanan",
+    perAll: "Semua data",
+    perDate: "Tanggal acuan",
+    perAllLabel: "Semua periode",
   },
   en: {
     dash: "Dashboard",
@@ -375,6 +418,15 @@ const L = {
     amtIn: "Transfer amount",
     amtOut: "Expense amount",
     note: "Transfer proof note",
+    proof: "Transfer proof (image)",
+    proofBig: "Image must be under 8 MB",
+    proofHint: "Photos are automatically resized to save space",
+    chooseFile: "Choose file",
+    noFileChosen: "No file chosen",
+    fileAttached: "Image attached",
+    viewProof: "View proof",
+    destAcc: "Destination account no.",
+    searchTx: "Search name, phone, note, account...",
     status: "Payment status",
     stW: "Awaiting bank check",
     stV: "Received in account",
@@ -430,8 +482,8 @@ const L = {
     forgot: "Forgot password?",
     haveAcc: "Already have an account? Sign in",
     noAcc: "No account yet? Sign up",
-    welcome: "Sign in to Event Treasury",
-    welcomeSub: "Track event income, donations and expenses.",
+    welcome: "Treasury System",
+    welcomeSub: "Event financial recording system.",
     setupT: "Create the first admin account",
     setupSub: "This account manages settings, users and the activity log.",
     createAdmin: "Create admin account",
@@ -496,19 +548,33 @@ const L = {
     gGo: "Continue",
     byAdmin: "by admin {n}",
     bulk: "Bulk actions",
+    themeToggle: "Toggle light/dark theme",
+    copyright: "All rights reserved.",
+    customCol: "Custom",
+    addCol: "+ Add custom column",
+    customFields: "Additional fields",
+    perWeek: "Weekly",
+    perMonth: "Monthly",
+    perAll: "All data",
+    perDate: "Reference date",
+    perAllLabel: "All time",
   },
 };
 const t = (k, v = {}) =>
   String(L[lang][k] || k).replace(/\{(\w+)\}/g, (_, x) => v[x]);
 const FL = {
+  no: { id: "No", en: "No" },
   date: { id: "Tanggal", en: "Date" },
   type: { id: "Jenis", en: "Type" },
   name: { id: "Nama", en: "Name" },
-  phone: { id: "WhatsApp", en: "WhatsApp" },
+  phone: { id: "No. WhatsApp", en: "WhatsApp No." },
   cat: { id: "Kategori", en: "Category" },
-  seats: { id: "Kursi", en: "Seats" },
+  seats: { id: "Jumlah Kursi", en: "Seat Count" },
+  debit: { id: "Debit (Rp)", en: "Debit (Rp)" },
+  credit: { id: "Kredit (Rp)", en: "Credit (Rp)" },
   amount: { id: "Nominal", en: "Amount" },
   bank: { id: "Rekening", en: "Account" },
+  destAcc: { id: "No. Rekening Tujuan", en: "Destination Account No." },
   status: { id: "Status", en: "Status" },
   note: { id: "Catatan", en: "Note" },
 };
@@ -581,16 +647,18 @@ function byPerson(ty) {
 async function boot() {
   try {
     const r = await window.storage.get(LKEY, false);
+    await pull();
     if (r && r.value) {
       const v = JSON.parse(r.value);
       lang = v.lang || "id";
-      await pull();
+      theme = v.theme || "light";
       me = S.users.find((u) => u.email === v.email && u.active) || null;
       if (me && v.imp) imp = S.users.find((u) => u.email === v.imp) || null;
     }
   } catch (e) {
     await pull();
   }
+  applyTheme();
   if (!S.users.length) {
     screen = "setup";
   } else if (!me) {
@@ -634,7 +702,7 @@ function render() {
   }
 }
 function langSeg() {
-  return `<div class="seg">${["id", "en"]
+  return `<div class="seg" style="flex:none">${["id", "en"]
     .map(
       (l) =>
         `<button class="${lang === l ? "on" : ""}" onclick="setLang('${l}')">${l.toUpperCase()}</button>`,
@@ -646,28 +714,51 @@ async function setLang(l) {
   await saveSession();
   render();
 }
+const copyrightLine = () =>
+  `<div class="hint" style="text-align:center;margin-top:16px">© ${new Date().getFullYear()} Michael Jonathan. ${t("copyright")}</div>`;
+const sunIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>`;
+const moonIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
+const themeBtn = () =>
+  `<button type="button" class="btn ghost sm icon" onclick="toggleTheme()" title="${t("themeToggle")}" aria-label="${t("themeToggle")}">${theme === "dark" ? sunIcon : moonIcon}</button>`;
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", theme);
+}
+async function toggleTheme() {
+  theme = theme === "dark" ? "light" : "dark";
+  applyTheme();
+  await saveSession();
+  render();
+}
 
 /* ================= layar setup & auth ================= */
 function vSetup() {
+  if (!setupRec) setupRec = recoveryCode();
   return `<div class="auth"><div class="authbox">
-  <div class="rowsp" style="margin-bottom:14px"><div style="display:flex;gap:10px;align-items:center">
-    <div class="mark">K</div><h1 style="font-size:19px">${t("setupT")}</h1></div>${langSeg()}</div>
+  <div class="rowsp" style="margin-bottom:14px;flex-wrap:wrap;row-gap:10px"><div style="display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 auto">
+    <div class="mark">TS</div><h1 style="font-size:19px">${t("setupT")}</h1></div>
+    <div style="display:flex;gap:6px;align-items:center;flex:none">${themeBtn()}${langSeg()}</div></div>
   <div class="card" style="padding:20px">
     <p class="hint" style="margin:0 0 14px">${t("setupSub")}</p>
-    <div class="field"><label>${t("fullName")}</label><input id="a_name"></div>
-    <div class="field"><label>${t("email")}</label><input id="a_email" type="email" autocomplete="username"></div>
-    <div class="field"><label>${t("pass")}</label><input id="a_pass" type="password" autocomplete="new-password"></div>
-    <div class="field"><label>${t("recovNew")}</label><input id="a_rec" value="${uid().toUpperCase()}">
+    <div class="field"><label>${t("fullName")}</label>
+      <input id="a_name" placeholder="Michael Jonathan"></div>
+    <div class="field"><label>${t("email")}</label>
+      <input id="a_email" type="email" autocomplete="username" placeholder="michael@email.com"></div>
+    <div class="field"><label>${t("pass")}</label>
+      <div class="pw"><input id="a_pass" type="password" autocomplete="new-password" placeholder="Minimal 8 karakter">
+        <button type="button" class="eye" onclick="toggleEye(this)">${eyeOn}</button></div></div>
+    <div class="field"><label>${t("recovNew")}</label>
+      <input id="a_rec" value="${setupRec}" readonly>
       <div class="hint" style="margin-top:4px">${t("recovHint")}</div></div>
     <button class="btn wide" onclick="createFirst()">${t("createAdmin")}</button>
-  </div></div></div>`;
+  </div>${copyrightLine()}</div></div>`;
 }
 async function createFirst() {
+  const rc = setupRec;
   const n = val("a_name"),
     e = val("a_email").toLowerCase(),
-    p = val("a_pass"),
-    rc = val("a_rec");
-  if (!n || !e || !p || !rc) return toast(t("fillAll"));
+    p = val("a_pass");
+    // rc = val(setupRec);
+  if (!n || !e || !p) return toast(t("fillAll"));
   if (p.length < 8) return toast(t("passShort"));
   const u = {
     id: uid(),
@@ -681,6 +772,8 @@ async function createFirst() {
     created: now(),
     last: now(),
   };
+  me = u;
+  imp = null;
   await mutate(
     () => {
       S.users.push(u);
@@ -688,8 +781,6 @@ async function createFirst() {
     "actSignup",
     "admin " + e,
   );
-  me = u;
-  imp = null;
   await saveSession();
   screen = "app";
   render();
@@ -700,43 +791,44 @@ const val = (i) => (document.getElementById(i)?.value || "").trim();
 function vAuth() {
   const f = authMode;
   return `<div class="auth"><div class="authbox">
-  <div class="rowsp" style="margin-bottom:14px"><div style="display:flex;gap:10px;align-items:center">
-    <div class="mark">K</div><div><h1 style="font-size:19px">${f === "forgot" ? t("forgotT") : t("welcome")}</h1>
-    <div class="hint">${f === "forgot" ? t("forgotSub") : t("welcomeSub")}</div></div></div>${langSeg()}</div>
+  <div class="rowsp" style="margin-bottom:14px;flex-wrap:wrap;row-gap:10px"><div style="display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 auto">
+    <div class="mark">TS</div><div style="min-width:0"><h1 style="font-size:19px">${f === "forgot" ? t("forgotT") : t("welcome")}</h1>
+    <div class="hint">${f === "forgot" ? t("forgotSub") : t("welcomeSub")}</div></div></div>
+    <div style="display:flex;gap:6px;align-items:center;flex:none">${themeBtn()}${langSeg()}</div></div>
   <div class="card" style="padding:20px">
   ${
     f === "in"
       ? `
-    <div class="field"><label>${t("email")}</label><input id="i_email" type="email" autocomplete="username"></div>
-    <div class="field"><label>${t("pass")}</label><input id="i_pass" type="password" autocomplete="current-password"
+    <div class="field"><label>${t("email")}</label><input id="i_email" type="email" autocomplete="username" placeholder="michael@email.com"></div>
+    <div class="field"><label>${t("pass")}</label><input id="i_pass" type="password" autocomplete="current-password" placeholder="••••••••"
       onkeydown="if(event.key==='Enter')doSignIn()"></div>
     <button class="btn wide" onclick="doSignIn()">${t("signIn")}</button>
     <div class="divider">atau</div>
     <button class="gbtn" onclick="googleFlow()">${gIcon()} ${t("google")}</button>
     <div class="rowsp" style="margin-top:14px">
-      <button class="btn ghost sm" onclick="authMode='forgot';render()">${t("forgot")}</button>
-      <button class="btn ghost sm" onclick="authMode='up';render()">${t("signUp")}</button></div>`
+      <button class="btn ghost sm" onclick="setAuthMode('forgot')">${t("forgot")}</button>
+      <button class="btn ghost sm" onclick="setAuthMode('up')">${t("signUp")}</button></div>`
       : f === "up"
         ? `
     <div class="field"><label>${t("fullName")}</label><input id="u_name"></div>
     <div class="field"><label>${t("email")}</label><input id="u_email" type="email" autocomplete="username"></div>
     <div class="field"><label>${t("pass")}</label><input id="u_pass" type="password" autocomplete="new-password"></div>
     <div class="field"><label>${t("pass2")}</label><input id="u_pass2" type="password" autocomplete="new-password"></div>
-    <div class="field"><label>${t("recovNew")}</label><input id="u_rec" value="${uid().toUpperCase()}">
+    <div class="field"><label>${t("recovNew")}</label><input id="u_rec" value="${uid().toUpperCase()}" readonly>
       <div class="hint" style="margin-top:4px">${t("recovHint")}</div></div>
     <button class="btn wide" onclick="doSignUp()">${t("signUp")}</button>
     <div class="divider">atau</div>
     <button class="gbtn" onclick="googleFlow()">${gIcon()} ${t("google")}</button>
-    <button class="btn ghost sm wide" style="margin-top:14px" onclick="authMode='in';render()">${t("haveAcc")}</button>`
+    <button class="btn ghost sm wide" style="margin-top:14px" onclick="setAuthMode('in')">${t("haveAcc")}</button>`
         : `
     <div class="field"><label>${t("email")}</label><input id="r_email" type="email"></div>
     <div class="field"><label>${t("recov")}</label><input id="r_rec"></div>
     <div class="field"><label>${t("newPass")}</label><input id="r_pass" type="password"></div>
     <button class="btn wide" onclick="doForgot()">${t("resetPass")}</button>
     <p class="hint" style="margin:12px 0 0">${t("reqAdmin")}</p>
-    <button class="btn ghost sm wide" style="margin-top:10px" onclick="authMode='in';render()">${t("signIn")}</button>`
+    <button class="btn ghost sm wide" style="margin-top:10px" onclick="setAuthMode('in')">${t("signIn")}</button>`
   }
-  </div></div></div>`;
+  </div>${copyrightLine()}</div></div>`;
 }
 function gIcon() {
   return `<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.6 30.1 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.8 6.1C12.3 13.2 17.6 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.2-.4-4.7H24v9h12.7c-.5 3-2.2 5.5-4.7 7.2l7.3 5.7c4.3-4 6.8-9.9 6.8-17.2z"/><path fill="#FBBC05" d="M10.4 28.7c-.5-1.5-.8-3-.8-4.7s.3-3.2.8-4.7l-7.8-6.1C.9 16.4 0 20.1 0 24s.9 7.6 2.6 10.8l7.8-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.3-5.7c-2 1.4-4.7 2.3-8.6 2.3-6.4 0-11.7-3.7-13.6-8.8l-7.8 6.1C6.5 42.6 14.6 48 24 48z"/></svg>`;
@@ -803,7 +895,7 @@ async function doSignUp() {
 }
 function googleFlow() {
   sheet(`<div class="rowsp" style="margin-bottom:10px"><h2 style="font-size:19px">${t("gTitle")}</h2>
-    <button class="btn ghost sm" onclick="closeSheet()">${t("close")}</button></div>
+    ${closeBtn()}</div>
     <p class="hint" style="margin:0 0 12px">${t("gSub")}</p>
     <div class="field"><label>${t("email")}</label><input id="g_email" type="email" placeholder="nama@gmail.com"></div>
     <div class="field"><label>${t("fullName")}</label><input id="g_name"></div>
@@ -880,6 +972,25 @@ async function doSignOut(silent) {
   authMode = "in";
   render();
 }
+const eyeOn = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const eyeOff = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.9 4.2A10.9 10.9 0 0 1 12 4c6.5 0 10 7 10 7a17 17 0 0 1-3 3.9M6.6 6.6A17 17 0 0 0 2 11s3.5 7 10 7a10.9 10.9 0 0 0 4.1-.8"/><path d="M3 3l18 18"/></svg>`;
+
+function toggleEye(btn) {
+  const inp = btn.parentElement.querySelector("input");
+  const hidden = inp.type === "password";
+  inp.type = hidden ? "text" : "password";
+  btn.innerHTML = hidden ? eyeOff : eyeOn;
+}
+
+// kode pemulihan dibuat sekali, tetap sama walau layar digambar ulang
+let setupRec = "";
+function recoveryCode() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(4)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()
+    .replace(/(.{4})(.{4})/, "$1-$2"); // contoh: 3F9A-1C0B
+}
 
 /* ================= kerangka aplikasi ================= */
 function vApp() {
@@ -899,12 +1010,13 @@ function vApp() {
       : ""
   }
   <header><div class="wrap">
-    <div class="mark">K</div>
+    <div class="mark">TS</div>
     <div style="flex:1;min-width:0"><h1 style="font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(D().event || "Konser")}</h1>
       <div class="sub">${(D().date ? new Date(D().date + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", { day: "numeric", month: "short", year: "numeric" }) + " · " : "") + s.sold + " " + t("seatsSold")}</div></div>
+    ${themeBtn()}
     ${langSeg()}
-    <button class="btn ghost sm" onclick="exportExcel()">${t("xls")}</button>
-    <div class="avatar" onclick="openMe()" title="${esc(a.name)}">${esc(a.name.slice(0, 2).toUpperCase())}</div>
+    <button class="btn ghost sm xls-btn" onclick="openExportPeriod()">${downloadIcon}<span class="xls-label">${t("xls")}</span></button>
+    <div class="avatar" onclick="openMe()" title="${esc(a.name)}">${esc(a.name.slice(0, 1).toUpperCase())}</div>
   </div></header>
   <div class="wrap">${{ dash: vDash, tx: vTx, board: vBoard, admin: vAdmin }[tab]()}</div>
   ${tab === "tx" || tab === "dash" ? `<button class="btn fab" onclick="openTx()">${t("add")}</button>` : ""}
@@ -914,10 +1026,31 @@ function go(k) {
   tab = k;
   render();
 }
+function setAuthMode(f) {
+  authMode = f;
+  render();
+}
+function setPanel(p) {
+  panel = p;
+  render();
+}
+function setFilter(k) {
+  filter = k;
+  render();
+}
+function setAdminTab(k) {
+  adminTab = k;
+  render();
+}
+function onLogSearch(v) {
+  logQ = v;
+  clearTimeout(window._lq);
+  window._lq = setTimeout(render, 250);
+}
 function openMe() {
   const a = acting();
   sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${esc(a.name)}</h2>
-    <button class="btn ghost sm" onclick="closeSheet()">${t("close")}</button></div>
+    ${closeBtn()}</div>
     <div class="hint" style="margin-bottom:6px">${esc(a.email)}</div>
     <span class="tag ${a.role === "admin" ? "t-adm" : "t-tic"}">${a.role === "admin" ? t("admins") : t("treas")}</span>
     ${
@@ -1008,7 +1141,7 @@ function vDash() {
       ]
         .map(
           ([p, l]) =>
-            `<button class="${panel === p ? "on" : ""}" onclick="panel='${p}';render()">${l}</button>`,
+            `<button class="${panel === p ? "on" : ""}" onclick="setPanel('${p}')">${l}</button>`,
         )
         .join("")}</div>
       <div style="display:flex;flex-direction:column;flex:1;min-height:0">${{ seats: pSeats, queue: pQueue, rank: pRank }[panel]()}</div>
@@ -1023,6 +1156,8 @@ function drawChart() {
   const el = document.getElementById("c1");
   if (!el) return;
   const s = seriesByDay(narrow() ? 7 : 14);
+  const cs = getComputedStyle(document.documentElement);
+  const cv = (n) => cs.getPropertyValue(n).trim();
   chart1 && chart1.destroy();
   chart1 = new Chart(el, {
     type: "bar",
@@ -1031,8 +1166,8 @@ function drawChart() {
       datasets: [
         {
           data: s.map((x) => x.v),
-          backgroundColor: "#2F6FEB",
-          hoverBackgroundColor: "#2258C4",
+          backgroundColor: cv("--blue"),
+          hoverBackgroundColor: cv("--blue-d"),
           borderRadius: 5,
           maxBarThickness: 38,
         },
@@ -1051,13 +1186,13 @@ function drawChart() {
         x: {
           grid: { display: false },
           border: { display: false },
-          ticks: { color: "#6B6B66", font: { size: 12 } },
+          ticks: { color: cv("--tx2"), font: { size: 12 } },
         },
         y: {
-          grid: { color: "#F0EFEC" },
+          grid: { color: cv("--line2") },
           border: { display: false },
           ticks: {
-            color: "#6B6B66",
+            color: cv("--tx2"),
             font: { size: 12 },
             maxTicksLimit: 4,
             callback: (v) =>
@@ -1074,16 +1209,59 @@ function drawChart() {
 }
 
 /* ================= transaksi ================= */
+function txMatches(x, q) {
+  return (
+    !q ||
+    [x.name, x.phone, x.note, x.bank, x.cat, x.destAcc, x.by]
+      .join(" ")
+      .toLowerCase()
+      .includes(q)
+  );
+}
+function sortTx(arr) {
+  const { k, dir } = txSort,
+    mul = dir === "asc" ? 1 : -1;
+  return arr.slice().sort((a, b) => {
+    let av = a[k],
+      bv = b[k];
+    if (k === "amount") {
+      av = +av || 0;
+      bv = +bv || 0;
+    } else {
+      av = String(av ?? "").toLowerCase();
+      bv = String(bv ?? "").toLowerCase();
+    }
+    return av > bv ? mul : av < bv ? -mul : 0;
+  });
+}
+function setTxSort(k) {
+  txSort =
+    txSort.k === k
+      ? { k, dir: txSort.dir === "asc" ? "desc" : "asc" }
+      : { k, dir: "asc" };
+  render();
+}
+function onTxSearch(v) {
+  txQ = v;
+  clearTimeout(window._tq);
+  window._tq = setTimeout(render, 250);
+}
 function vTx() {
-  const f = S.tx
-    .filter(
+  const q = txQ.toLowerCase();
+  const f = sortTx(
+    S.tx.filter(
       (x) =>
-        filter === "all" ||
-        (filter === "pending" ? x.status === "pending" : x.type === filter),
-    )
-    .sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+        (filter === "all" ||
+          (filter === "pending"
+            ? x.status === "pending"
+            : x.type === filter)) &&
+        txMatches(x, q),
+    ),
+  );
+  const si = (k) =>
+    txSort.k === k ? (txSort.dir === "asc" ? " ▲" : " ▼") : "";
   return `<div style="padding:12px 0 110px">
-  <div class="rowsp" style="margin-bottom:11px;flex-wrap:wrap">
+  <div class="rowsp" style="margin-bottom:11px;flex-wrap:wrap;gap:8px">
     <div class="chips">${[
       ["all", t("all")],
       ["pending", t("unchecked")],
@@ -1093,14 +1271,20 @@ function vTx() {
     ]
       .map(
         ([k, l]) =>
-          `<button class="chip ${filter === k ? "on" : ""}" onclick="filter='${k}';render()">${l}</button>`,
+          `<button class="chip ${filter === k ? "on" : ""}" onclick="setFilter('${k}')">${l}</button>`,
       )
       .join("")}</div>
-    <button class="btn ghost sm" onclick="openImport()">${t("imp")}</button></div>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:200px">
+      <input style="max-width:280px" placeholder="${t("searchTx")}" value="${esc(txQ)}" oninput="onTxSearch(this.value)">
+      <button class="btn ghost sm" onclick="openImport()">${t("imp")}</button></div></div>
   <div class="card" style="padding:2px 10px">${
     f.length
       ? `<div class="scroll" style="max-height:calc(100dvh - 210px)"><table><thead><tr>
-    <th>${t("date")}</th><th>${t("name")}</th><th>${t("detail")}</th><th style="text-align:right">${t("amount")}</th><th></th></tr></thead><tbody>
+    <th class="sortable" onclick="setTxSort('date')">${t("date")}${si("date")}</th>
+    <th class="sortable" onclick="setTxSort('name')">${t("name")}${si("name")}</th>
+    <th>${t("detail")}</th>
+    <th class="sortable" style="text-align:right" onclick="setTxSort('amount')">${t("amount")}${si("amount")}</th>
+    <th></th></tr></thead><tbody>
     ${f
       .map(
         (x) => `<tr>
@@ -1111,10 +1295,10 @@ function vTx() {
           ? `<span class="tag t-exp">${t("expW")}</span> ${esc(x.cat || "")}`
           : `<span class="tag ${x.type === "donation" ? "t-ok" : "t-tic"}">${x.type === "donation" ? t("donW") : t("seatsW")}</span> ${esc(x.cat || "")} · ${x.seats || 0}`
       }
-        <div class="hint">${esc(x.bank || "-")}${x.note ? " · " + esc(x.note) : ""}</div></td>
+        <div class="hint">${esc(x.bank || "-")}${x.type === "expense" && x.destAcc ? " → " + esc(x.destAcc) : ""}${x.note ? " · " + esc(x.note) : ""}</div></td>
       <td class="mono ${x.type === "expense" ? "neg" : ""}" style="text-align:right;white-space:nowrap;font-weight:600">${x.type === "expense" ? "−" : ""}${rp(x.amount)}
         <div style="margin-top:3px">${x.status === "verified" ? `<span class="tag t-ok">${t("inRek")}</span>` : `<span class="tag t-wait">${t("stW")}</span>`}</div></td>
-      <td style="text-align:right;white-space:nowrap">${x.status === "pending" ? `<button class="btn ok sm" onclick="verify('${x.id}')">${t("inRek")}</button> ` : ""}
+      <td style="text-align:right;white-space:nowrap">${x.proof ? `<button class="btn ghost sm icon" onclick="viewProofById('${x.id}')" title="${t("viewProof")}">${proofIcon}</button> ` : ""}${x.status === "pending" ? `<button class="btn ok sm" onclick="verify('${x.id}')">${t("inRek")}</button> ` : ""}
         <button class="btn ghost sm" onclick="openTx('${x.id}')">${t("edit")}</button></td></tr>`,
       )
       .join("")}
@@ -1153,10 +1337,12 @@ function openTx(id) {
         amount: D().cats[0]?.p || 0,
         bank: D().banks[0] || "",
         note: "",
+        proof: "",
+        destAcc: "",
         status: "pending",
       };
   sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${id ? t("editTx") : t("newTx")}</h2>
-      <button class="btn ghost sm" onclick="closeSheet()">${t("close")}</button></div>
+      ${closeBtn()}</div>
     <div class="chips" style="margin-bottom:14px" id="typeChips">
       ${[
         ["ticket", t("tBuy")],
@@ -1184,16 +1370,44 @@ function openTx(id) {
             `<option ${c.n === x.cat ? "selected" : ""}>${esc(c.n)}</option>`,
         )
         .join("")}</select></div>
-      <div class="field" id="w_seats"><label>${t("nSeat")}</label><input type="number" inputmode="numeric" min="0" id="f_seats" value="${x.seats || 0}" oninput="recalc()"></div>
+      <div class="field" id="w_seats"><label>${t("nSeat")}</label>
+        <div class="stepper">
+          <button type="button" class="step-btn" onclick="stepSeats(-1)" aria-label="-">−</button>
+          <input type="number" inputmode="numeric" min="0" id="f_seats" value="${x.seats || 0}" oninput="recalc()">
+          <button type="button" class="step-btn" onclick="stepSeats(1)" aria-label="+">+</button>
+        </div></div>
     </div>
-    <div class="field" id="w_expcat" style="display:none"><label>${t("purpose")}</label><input id="f_expcat" value="${x.type === "expense" ? esc(x.cat) : ""}"></div>
+    <div class="grid" id="w_expcat" style="display:none;grid-template-columns:1fr 1fr">
+      <div class="field"><label>${t("purpose")}</label><input id="f_expcat" value="${x.type === "expense" ? esc(x.cat) : ""}"></div>
+      <div class="field"><label>${t("destAcc")}</label><input id="f_destacc" value="${x.type === "expense" ? esc(x.destAcc || "") : ""}" placeholder="1234567890 a.n. ..."></div>
+    </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="field"><label id="l_amount">${t("amtIn")}</label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev()">
+      <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev()">
         <div class="hint mono" id="prev" style="margin-top:4px">${rp(x.amount)}</div></div>
       <div class="field"><label>${t("status")}</label><select id="f_status">
         <option value="pending" ${x.status === "pending" ? "selected" : ""}>${t("stW")}</option>
         <option value="verified" ${x.status === "verified" ? "selected" : ""}>${t("stV")}</option></select></div></div>
     <div class="field"><label>${t("note")}</label><textarea id="f_note" rows="2">${esc(x.note)}</textarea></div>
+    <div class="field"><label>${t("proof")}</label>
+      <div class="filepick">
+        <button type="button" class="btn ghost sm" onclick="document.getElementById('f_proofFile').click()">${t("chooseFile")}</button>
+        <span class="hint" id="proofFileName">${x.proof ? t("fileAttached") : t("noFileChosen")}</span>
+      </div>
+      <input type="file" id="f_proofFile" accept="image/*" style="display:none" onchange="onProofChange(event)">
+      <div class="hint" style="margin-top:4px">${t("proofHint")}</div>
+      <div class="proof-prev" id="proofPrev" style="margin-top:8px">${x.proof ? `<img src="${x.proof}" onclick="viewProofPreview()">` : ""}</div>
+      <input type="hidden" id="f_proof" value="${esc(x.proof || "")}"></div>
+    ${(() => {
+      const cf = D().tpl.filter((c) => c.custom);
+      if (!cf.length) return "";
+      return `<div class="field"><label>${t("customFields")}</label>
+        <div class="grid" style="grid-template-columns:1fr 1fr">${cf
+          .map(
+            (c) =>
+              `<div class="field"><label>${esc(c.h)}</label><input id="fc_${c.f}" value="${esc((x.custom && x.custom[c.f]) || "")}"></div>`,
+          )
+          .join("")}</div></div>`;
+    })()}
     <div class="rowsp" style="margin-top:14px">${id ? `<button class="btn danger" onclick="delTx('${id}')">${t("del")}</button>` : "<span></span>"}
       <button class="btn" onclick="saveTx()">${t("save")}</button></div>`);
   setType(x.type, true);
@@ -1216,6 +1430,65 @@ function prev() {
     +document.getElementById("f_amount").value || 0,
   );
 }
+function compressImage(file, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let w = img.naturalWidth,
+        h = img.naturalHeight;
+      if (w > h && w > maxDim) {
+        h = Math.round((h * maxDim) / w);
+        w = maxDim;
+      } else if (h > maxDim) {
+        w = Math.round((w * maxDim) / h);
+        h = maxDim;
+      }
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      c.getContext("2d").drawImage(img, 0, 0, w, h);
+      resolve(c.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("bad image"));
+    };
+    img.src = url;
+  });
+}
+async function onProofChange(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (file.size > 8 * 1024 * 1024) {
+    toast(t("proofBig"));
+    e.target.value = "";
+    return;
+  }
+  try {
+    const dataUrl = await compressImage(file, 1280, 0.72);
+    document.getElementById("f_proof").value = dataUrl;
+    document.getElementById("proofFileName").textContent = file.name;
+    document.getElementById("proofPrev").innerHTML =
+      `<img src="${dataUrl}" onclick="viewProofPreview()">`;
+  } catch (err) {
+    toast(t("proofBig"));
+    e.target.value = "";
+  }
+}
+function viewProof(src) {
+  sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${t("viewProof")}</h2>${closeBtn()}</div>
+    <img src="${src}" style="max-width:100%;border-radius:10px;display:block">`);
+}
+function viewProofPreview() {
+  const v = document.getElementById("f_proof")?.value;
+  if (v) viewProof(v);
+}
+function viewProofById(id) {
+  const x = S.tx.find((v) => v.id === id);
+  if (x && x.proof) viewProof(x.proof);
+}
 function setType(k, init) {
   document.getElementById("f_type").value = k;
   document
@@ -1226,7 +1499,7 @@ function setType(k, init) {
     (i) => (document.getElementById(i).style.display = e ? "none" : "block"),
   );
   document.getElementById("w_phone").style.display = e ? "none" : "block";
-  document.getElementById("w_expcat").style.display = e ? "block" : "none";
+  document.getElementById("w_expcat").style.display = e ? "grid" : "none";
   document.getElementById("l_name").textContent = e
     ? t("namePay")
     : k === "donation"
@@ -1241,6 +1514,11 @@ function setType(k, init) {
   document.getElementById("l_cat").textContent =
     k === "donation" ? t("catFree") : t("catSeat");
   if (!init && k === "ticket") recalc();
+}
+function stepSeats(d) {
+  const el = document.getElementById("f_seats");
+  el.value = Math.max(0, (+el.value || 0) + d);
+  recalc();
 }
 function recalc() {
   if (document.getElementById("f_type").value !== "ticket") return;
@@ -1268,9 +1546,19 @@ async function saveTx() {
     seats: ty === "expense" ? 0 : +g("seats") || 0,
     amount: +g("amount") || 0,
     bank: g("bank"),
+    destAcc: ty === "expense" ? g("destacc") : "",
     note: g("note"),
+    proof: g("proof"),
     status: g("status"),
     by: acting().name,
+    custom: Object.fromEntries(
+      D()
+        .tpl.filter((c) => c.custom)
+        .map((c) => [
+          c.f,
+          (document.getElementById("fc_" + c.f)?.value || "").trim(),
+        ]),
+    ),
   };
   if (!x.amount) return toast(t("needAmt"));
   await mutate(
@@ -1330,7 +1618,7 @@ function vAdmin() {
     ]
       .map(
         ([k, l]) =>
-          `<button class="${adminTab === k ? "on" : ""}" onclick="adminTab='${k}';render()">${l}</button>`,
+          `<button class="${adminTab === k ? "on" : ""}" onclick="setAdminTab('${k}')">${l}</button>`,
       )
       .join("")}</div>
     ${{ users: vUsers, logs: vLogs, set: vSet }[adminTab]()}</div>`;
@@ -1365,7 +1653,7 @@ function openUser(email) {
         provider: "password",
       };
   sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${email ? t("edit") : t("addUser")}</h2>
-    <button class="btn ghost sm" onclick="closeSheet()">${t("close")}</button></div>
+    ${closeBtn()}</div>
     <input type="hidden" id="v_old" value="${esc(email || "")}">
     <div class="field"><label>${t("fullName")}</label><input id="v_name" value="${esc(u.name)}"></div>
     <div class="field"><label>${t("email")}</label><input id="v_email" type="email" value="${esc(u.email)}" ${email ? "disabled" : ""}></div>
@@ -1470,7 +1758,7 @@ function vLogs() {
     <h2 style="font-size:17px">${t("logs")}</h2>
     <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:220px">
       <input style="max-width:320px" placeholder="${t("searchLog")}" value="${esc(logQ)}"
-        oninput="logQ=this.value;clearTimeout(window._lq);window._lq=setTimeout(render,250)">
+        oninput="onLogSearch(this.value)">
       <button class="btn ghost sm" onclick="exportLogs()">${t("exportLog")}</button></div></div>
   ${
     rows.length
@@ -1488,24 +1776,17 @@ function vLogs() {
       : `<div class="empty">${t("noLog")}</div>`
   }</div>`;
 }
-function exportLogs() {
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([
-      [t("time"), t("user"), t("email"), t("role"), t("action"), t("info")],
-      ...S.logs.map((l) => [
-        new Date(l.ts).toLocaleString(),
-        l.user,
-        l.email,
-        l.role,
-        t(l.act),
-        l.det,
-      ]),
-    ]),
-    "Log",
+async function exportLogs() {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet(lang === "id" ? "Log" : "Log");
+  ws.addRow([t("time"), t("user"), t("email"), t("role"), t("action"), t("info")]);
+  styleHeaderRow(ws, 1);
+  S.logs.forEach((l) =>
+    ws.addRow([new Date(l.ts).toLocaleString(), l.user, l.email, l.role, t(l.act), l.det]),
   );
-  XLSX.writeFile(wb, `Activity-Log-${today()}.xlsx`);
+  ws.columns.forEach((c) => (c.width = 22));
+  await downloadWorkbook(wb, `Activity-Log-${today()}.xlsx`);
   toast(t("exportLog"));
 }
 
@@ -1536,15 +1817,23 @@ function vSet() {
       <div><button class="btn ghost sm" style="margin-top:10px" onclick="addCat()">${t("addCat")}</button></div></div>
     <div class="card"><h2 style="font-size:17px">${t("tplTitle")}</h2>
       <p class="hint" style="margin:4px 0 8px">${t("tplP")}</p>
-      <div style="overflow-x:auto"><table><thead><tr><th>${t("field")}</th><th>${t("colName")}</th></tr></thead><tbody>
+      <div style="overflow-x:auto"><table><thead><tr><th>${t("field")}</th><th>${t("colName")}</th><th></th></tr></thead><tbody>
       ${D()
         .tpl.map(
-          (c, i) => `<tr><td style="font-weight:600">${FL[c.f][lang]}</td>
-        <td><input value="${esc(c.h)}" onchange="editTpl(${i},this.value)"></td></tr>`,
+          (c, i) => `<tr><td style="font-weight:600">${
+            c.custom
+              ? `<span class="tag t-tic">${t("customCol")}</span>`
+              : FL[c.f]
+                ? FL[c.f][lang]
+                : c.f
+          }</td>
+        <td><input value="${esc(c.h)}" onchange="editTpl(${i},this.value)"></td>
+        <td><button class="btn danger sm" onclick="delTplCol(${i})">${t("del")}</button></td></tr>`,
         )
         .join("")}
       </tbody></table></div>
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn ghost sm" onclick="addCustomCol()">${t("addCol")}</button>
         <button class="btn ghost sm" onclick="dlTemplate()">${t("dlTpl")}</button>
         <button class="btn sm" onclick="openImport()">${t("imp")}</button></div></div></div>
   <div class="card"><h2 style="font-size:17px">${t("dataT")}</h2>
@@ -1588,6 +1877,28 @@ async function editTpl(i, v) {
     t("tplTitle") + ": " + v,
   );
 }
+async function addCustomCol() {
+  const f = "c_" + uid();
+  await mutate(
+    () => {
+      S.config.tpl.push({ f, h: t("customCol"), custom: true });
+    },
+    "actSet",
+    t("addCol"),
+  );
+  render();
+}
+async function delTplCol(i) {
+  const c = S.config.tpl[i];
+  await mutate(
+    () => {
+      S.config.tpl.splice(i, 1);
+    },
+    "actSet",
+    t("del") + ": " + c.h,
+  );
+  render();
+}
 async function addCat() {
   await mutate(
     () => {
@@ -1623,60 +1934,157 @@ async function resetAll() {
   toast(t("cleared"));
 }
 
+/* ================= laporan: periode & styling ================= */
+const MONTHS = {
+  id: [
+    "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+  ],
+  en: [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ],
+};
+function weekOfMonth(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const first = new Date(d.getFullYear(), d.getMonth(), 1);
+  const wd = (first.getDay() + 6) % 7; // Senin=0
+  return Math.ceil((d.getDate() + wd) / 7);
+}
+function periodLabel(dateStr, kind) {
+  if (kind === "all") return t("perAllLabel");
+  const d = new Date(dateStr + "T00:00:00");
+  const mn = MONTHS[lang][d.getMonth()];
+  return kind === "month"
+    ? `${lang === "id" ? "Periode" : "Period"} ${mn} ${d.getFullYear()}`
+    : `${lang === "id" ? "Periode" : "Period"} ${mn} W-${weekOfMonth(dateStr)}`;
+}
+function txInPeriod(x, kind, refDate) {
+  if (kind === "all" || !refDate) return true;
+  const d = new Date(x.date + "T00:00:00"),
+    r = new Date(refDate + "T00:00:00");
+  if (d.getFullYear() !== r.getFullYear() || d.getMonth() !== r.getMonth())
+    return false;
+  return kind === "month" ? true : weekOfMonth(x.date) === weekOfMonth(refDate);
+}
+function cellValue(x, c, no) {
+  if (c.f === "no") return no;
+  if (c.f === "type")
+    return { ticket: t("tBuy"), donation: t("tDon"), expense: t("tExp") }[x.type];
+  if (c.f === "debit") return x.type === "expense" ? null : x.amount;
+  if (c.f === "credit") return x.type === "expense" ? x.amount : null;
+  if (c.f === "status") return x.status === "verified" ? t("inRek") : t("stW");
+  if (c.custom) return (x.custom && x.custom[c.f]) || "";
+  return x[c.f] ?? "";
+}
+function addReportTitle(ws, subtitle) {
+  const n = D().tpl.length;
+  ws.mergeCells(1, 1, 1, n);
+  const c1 = ws.getCell(1, 1);
+  c1.value = lang === "id" ? "LAPORAN KEUANGAN" : "FINANCIAL REPORT";
+  c1.font = { bold: true, size: 15 };
+  c1.alignment = { horizontal: "center" };
+  ws.mergeCells(2, 1, 2, n);
+  const c2 = ws.getCell(2, 1);
+  c2.value = subtitle;
+  c2.font = { bold: true, size: 11, color: { argb: "FF6B6B66" } };
+  c2.alignment = { horizontal: "center" };
+  ws.getRow(1).height = 22;
+}
+function addTxTable(ws, txList, tableName) {
+  const cols = D().tpl;
+  ws.addTable({
+    name: tableName + Math.floor(Math.random() * 1e6),
+    ref: "A4",
+    headerRow: true,
+    style: { theme: "TableStyleMedium2", showRowStripes: true },
+    columns: cols.map((c) => ({ name: c.h, filterButton: true })),
+    rows: txList.map((x, i) => cols.map((c) => cellValue(x, c, i + 1))),
+  });
+  cols.forEach((c, i) => {
+    const col = ws.getColumn(i + 1);
+    col.width = Math.max(c.h.length + 4, c.f === "note" ? 24 : c.f === "name" ? 20 : 13);
+    if (c.f === "debit" || c.f === "credit") col.numFmt = "#,##0";
+  });
+}
+function styleHeaderRow(ws, rowIdx) {
+  const row = ws.getRow(rowIdx);
+  row.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  row.eachCell((cell) => {
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+    cell.alignment = { vertical: "middle" };
+  });
+}
+async function downloadWorkbook(wb, filename) {
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /* ================= impor ================= */
-function dlTemplate() {
-  const hdr = D().tpl.map((c) => c.h),
-    id = lang === "id";
+async function dlTemplate() {
+  const id = lang === "id";
   const ex = [
-    [
-      today(),
-      id ? "Kursi" : "Seat",
-      "Budi Santoso",
-      "081234567890",
-      D().cats[0]?.n || "Reguler",
-      2,
-      (D().cats[0]?.p || 0) * 2,
-      D().banks[0] || "BCA",
-      id ? "Masuk" : "Received",
-      "Transfer 08.41",
-    ],
-    [
-      today(),
-      id ? "Donasi" : "Donation",
-      "PT Nada Jaya",
-      "",
-      D().cats[0]?.n || "Reguler",
-      10,
-      25000000,
-      D().banks[0] || "BCA",
-      id ? "Menunggu" : "Pending",
-      "",
-    ],
-    [
-      today(),
-      id ? "Pengeluaran" : "Expense",
-      "Sound System",
-      "",
-      "",
-      0,
-      7500000,
-      D().banks[0] || "BCA",
-      id ? "Masuk" : "Received",
-      "DP 50%",
-    ],
+    {
+      type: "ticket",
+      name: "Michael Jonathan",
+      phone: "081234567890",
+      cat: D().cats[0]?.n || "Reguler",
+      seats: 2,
+      amount: (D().cats[0]?.p || 0) * 2,
+      bank: D().banks[0] || "BCA",
+      status: "verified",
+      note: "Transfer 08.41",
+      date: today(),
+      custom: {},
+    },
+    {
+      type: "donation",
+      name: "PT Nada Jaya",
+      phone: "",
+      cat: D().cats[0]?.n || "Reguler",
+      seats: 10,
+      amount: 25000000,
+      bank: D().banks[0] || "BCA",
+      status: "pending",
+      note: "",
+      date: today(),
+      custom: {},
+    },
+    {
+      type: "expense",
+      name: "Sound System",
+      phone: "",
+      cat: "",
+      seats: 0,
+      amount: 7500000,
+      bank: D().banks[0] || "BCA",
+      status: "verified",
+      note: "DP 50%",
+      date: today(),
+      custom: {},
+    },
   ];
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([hdr, ...ex]),
-    "Template",
-  );
-  XLSX.writeFile(wb, "Template-Import.xlsx");
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet(id ? "Template" : "Template");
+  addReportTitle(ws, periodLabel(today(), "week"));
+  addTxTable(ws, ex, "TabelTemplate");
+  await downloadWorkbook(wb, "Template-Import.xlsx");
   toast(t("dlTpl"));
 }
 function openImport() {
   sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:20px">${t("imp")}</h2>
-    <button class="btn ghost sm" onclick="closeSheet()">${t("close")}</button></div>
+    ${closeBtn()}</div>
     <div class="drop" id="drop"><div style="font-size:17px;font-weight:600">${t("impDrop")}</div>
       <div class="hint" style="margin-top:4px">${t("impSub")} · .xlsx .xls .csv</div></div>
     <input type="file" id="file" accept=".xlsx,.xls,.csv" style="display:none">
@@ -1745,25 +2153,39 @@ function parseRows(rows) {
     const i = head.indexOf(String(c.h).trim().toLowerCase());
     if (i >= 0) idx[c.f] = i;
   });
-  if (idx.amount === undefined && idx.name === undefined)
+  if (
+    idx.name === undefined &&
+    idx.amount === undefined &&
+    idx.debit === undefined &&
+    idx.credit === undefined
+  )
     return (body.innerHTML = `<div class="empty">${t("noCol")}</div>`);
   const get = (r, f) => (idx[f] === undefined ? "" : r[idx[f]]);
+  const customCols = D().tpl.filter((c) => c.custom);
   pendingImp = [];
   let bad = 0;
   rows.slice(1).forEach((r) => {
     if (!r || !r.length || r.every((c) => String(c).trim() === "")) return;
-    const amt = normNum(get(r, "amount")),
+    const debit = normNum(get(r, "debit")),
+      credit = normNum(get(r, "credit")),
+      legacyAmt = normNum(get(r, "amount")),
+      amt = debit || credit || legacyAmt,
       dt = normDate(get(r, "date")) || today();
     if (!amt) {
       bad++;
       return;
     }
-    const ty = normType(get(r, "type"));
+    let ty = normType(get(r, "type"));
+    if (!String(get(r, "type") || "").trim() && credit && !debit) ty = "expense";
     const st = /masuk|verif|lunas|received|paid|ok/i.test(
       String(get(r, "status")),
     )
       ? "verified"
       : "pending";
+    const custom = {};
+    customCols.forEach((c) => {
+      custom[c.f] = String(get(r, c.f) || "");
+    });
     pendingImp.push({
       id: uid(),
       type: ty,
@@ -1776,9 +2198,12 @@ function parseRows(rows) {
       seats: ty === "expense" ? 0 : normNum(get(r, "seats")),
       amount: amt,
       bank: String(get(r, "bank") || D().banks[0] || ""),
+      destAcc: ty === "expense" ? String(get(r, "destAcc") || "") : "",
       note: String(get(r, "note") || ""),
+      proof: "",
       status: st,
       by: acting().name,
+      custom,
     });
   });
   const lbl = {
@@ -1819,106 +2244,188 @@ async function commitImport() {
 }
 
 /* ================= excel ================= */
-async function exportExcel() {
+function openExportPeriod() {
+  sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${t("xls")}</h2>${closeBtn()}</div>
+    <div class="seg" id="expSeg" style="margin-bottom:14px">${[
+      ["week", t("perWeek")],
+      ["month", t("perMonth")],
+      ["all", t("perAll")],
+    ]
+      .map(
+        ([k, l]) =>
+          `<button class="${exportKind === k ? "on" : ""}" data-k="${k}" onclick="setExportKind('${k}')">${l}</button>`,
+      )
+      .join("")}</div>
+    <div class="field" id="expDateWrap" style="${exportKind === "all" ? "display:none" : ""}">
+      <label>${t("perDate")}</label>
+      <input type="date" id="exp_date" value="${today()}" oninput="updateExportPreview()"></div>
+    <div class="hint mono" id="expPreview" style="margin-bottom:16px">${periodLabel(today(), exportKind)}</div>
+    <button class="btn wide" onclick="doExportExcel()">${t("xls")}</button>`);
+}
+function setExportKind(k) {
+  exportKind = k;
+  document
+    .querySelectorAll("#expSeg button")
+    .forEach((b) => b.classList.toggle("on", b.dataset.k === k));
+  document.getElementById("expDateWrap").style.display =
+    k === "all" ? "none" : "block";
+  updateExportPreview();
+}
+function updateExportPreview() {
+  const d = document.getElementById("exp_date")?.value || today();
+  document.getElementById("expPreview").textContent = periodLabel(d, exportKind);
+}
+async function doExportExcel() {
+  const refDate = document.getElementById("exp_date")?.value || today();
+  const kind = exportKind;
+  closeSheet();
+  await exportExcel(kind, refDate);
+}
+function buildSummarySheet(wb, s, kind, refDate) {
+  const id = lang === "id";
+  const ws = wb.addWorksheet(id ? "Ringkasan" : "Summary");
+  ws.addRows([
+    [id ? "LAPORAN KEUANGAN" : "FINANCIAL REPORT", D().event],
+    [t("evDate"), D().date || "-"],
+    [id ? "Periode" : "Period", periodLabel(refDate, kind)],
+    [id ? "Dicetak" : "Generated", new Date().toLocaleString()],
+    [id ? "Oleh" : "By", acting().name + " (" + acting().email + ")"],
+    [],
+    [t("ticket"), s.inTicket],
+    [t("don"), s.inDon],
+    [id ? "Total pemasukan" : "Total income", s.inTicket + s.inDon],
+    [t("exp"), s.exp],
+    [t("net"), s.net],
+    [],
+    [t("wait"), s.pendAmt],
+    [],
+    [t("quota"), s.quota],
+    [id ? "Kursi terjual" : "Seats sold", s.sold],
+    [id ? "Kursi dipesan belum lunas" : "Seats reserved unpaid", s.held],
+    [id ? "Kursi tersedia" : "Seats available", s.avail],
+  ]);
+  ws.getColumn(1).width = 28;
+  ws.getColumn(1).font = { bold: true };
+  ws.getColumn(2).width = 30;
+}
+function buildSeatsSheet(wb) {
+  const id = lang === "id";
+  const ws = wb.addWorksheet(id ? "Kursi" : "Seats");
+  ws.addRow([
+    t("catTitle"), t("price"), t("quota"),
+    id ? "Terjual" : "Sold", id ? "Sisa" : "Left", id ? "Nilai" : "Value",
+  ]);
+  styleHeaderRow(ws, 1);
+  D().cats.forEach((c) => {
+    const sd = S.tx
+      .filter((x) => x.status === "verified" && x.cat === c.n)
+      .reduce((a, b) => a + (+b.seats || 0), 0);
+    ws.addRow([c.n, c.p, c.q, sd, c.q - sd, sd * c.p]);
+  });
+  ws.columns.forEach((c) => (c.width = 16));
+}
+function buildTrendSheet(wb) {
+  const id = lang === "id";
+  const ws = wb.addWorksheet(id ? "Tren Harian" : "Daily Trend");
+  ws.addRow([t("date"), id ? "Pemasukan" : "Income"]);
+  styleHeaderRow(ws, 1);
+  seriesByDay(30).forEach((x) => ws.addRow([x.k, x.v]));
+  ws.columns.forEach((c) => (c.width = 16));
+}
+function buildRankSheet(wb) {
+  const id = lang === "id";
+  const ws = wb.addWorksheet(id ? "Peringkat" : "Rankings");
+  ws.addRow([t("topBuy")]);
+  ws.getCell(1, 1).font = { bold: true, size: 13 };
+  ws.addRow([t("name"), t("trans"), t("seatsW"), "Total"]);
+  styleHeaderRow(ws, 2);
+  byPerson("ticket").forEach((x) => ws.addRow([x.name, x.n, x.seats, x.amount]));
+  ws.addRow([]);
+  const r2 = ws.rowCount + 1;
+  ws.addRow([t("topDon")]);
+  ws.getCell(r2, 1).font = { bold: true, size: 13 };
+  ws.addRow([t("name"), t("trans"), t("seatsW"), "Total"]);
+  styleHeaderRow(ws, r2 + 1);
+  byPerson("donation").forEach((x) => ws.addRow([x.name, x.n, x.seats, x.amount]));
+  ws.columns.forEach((c) => (c.width = 20));
+}
+async function exportExcel(kind, refDate) {
   const s = sums(),
-    wb = XLSX.utils.book_new(),
     id = lang === "id";
-  XLSX.utils.book_append_sheet(
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Kas Acara";
+  const txRows = S.tx
+    .filter((x) => txInPeriod(x, kind, refDate))
+    .slice()
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const wsTx = wb.addWorksheet(id ? "Transaksi" : "Transactions");
+  addReportTitle(wsTx, periodLabel(refDate, kind));
+  addTxTable(wsTx, txRows, "TabelTransaksi");
+  buildSummarySheet(wb, s, kind, refDate);
+  buildSeatsSheet(wb);
+  buildTrendSheet(wb);
+  buildRankSheet(wb);
+  await downloadWorkbook(
     wb,
-    XLSX.utils.aoa_to_sheet([
-      [id ? "LAPORAN KEUANGAN" : "FINANCIAL REPORT", D().event],
-      [t("evDate"), D().date || "-"],
-      [id ? "Dicetak" : "Generated", new Date().toLocaleString()],
-      [id ? "Oleh" : "By", acting().name + " (" + acting().email + ")"],
-      [],
-      [t("ticket"), s.inTicket],
-      [t("don"), s.inDon],
-      [id ? "Total pemasukan" : "Total income", s.inTicket + s.inDon],
-      [t("exp"), s.exp],
-      [t("net"), s.net],
-      [],
-      [t("wait"), s.pendAmt],
-      [],
-      [t("quota"), s.quota],
-      [id ? "Kursi terjual" : "Seats sold", s.sold],
-      [id ? "Kursi dipesan belum lunas" : "Seats reserved unpaid", s.held],
-      [id ? "Kursi tersedia" : "Seats available", s.avail],
-    ]),
-    id ? "Ringkasan" : "Summary",
-  );
-  const lbl = { ticket: t("tBuy"), donation: t("tDon"), expense: t("tExp") };
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([
-      [...D().tpl.map((c) => c.h), id ? "Dicatat oleh" : "Recorded by"],
-      ...S.tx
-        .slice()
-        .sort((a, b) => a.date.localeCompare(b.date))
-        .map((x) => [
-          ...D().tpl.map((c) =>
-            c.f === "type"
-              ? lbl[x.type]
-              : c.f === "status"
-                ? x.status === "verified"
-                  ? t("inRek")
-                  : t("stW")
-                : c.f === "amount"
-                  ? x.type === "expense"
-                    ? -x.amount
-                    : x.amount
-                  : x[c.f],
-          ),
-          x.by || "",
-        ]),
-    ]),
-    id ? "Transaksi" : "Transactions",
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([
-      [
-        t("catTitle"),
-        t("price"),
-        t("quota"),
-        id ? "Terjual" : "Sold",
-        id ? "Sisa" : "Left",
-        id ? "Nilai" : "Value",
-      ],
-      ...D().cats.map((c) => {
-        const sd = S.tx
-          .filter((x) => x.status === "verified" && x.cat === c.n)
-          .reduce((a, b) => a + (+b.seats || 0), 0);
-        return [c.n, c.p, c.q, sd, c.q - sd, sd * c.p];
-      }),
-    ]),
-    id ? "Kursi" : "Seats",
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([
-      [t("date"), id ? "Pemasukan" : "Income"],
-      ...seriesByDay(30).map((x) => [x.k, x.v]),
-    ]),
-    id ? "Tren Harian" : "Daily Trend",
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([
-      [t("topBuy")],
-      [t("name"), t("trans"), t("seatsW"), "Total"],
-      ...byPerson("ticket").map((x) => [x.name, x.n, x.seats, x.amount]),
-      [],
-      [t("topDon")],
-      [t("name"), t("trans"), t("seatsW"), "Total"],
-      ...byPerson("donation").map((x) => [x.name, x.n, x.seats, x.amount]),
-    ]),
-    id ? "Peringkat" : "Rankings",
-  );
-  XLSX.writeFile(
-    wb,
-    `${id ? "Laporan" : "Report"}-${(D().event || "Konser").replace(/\s+/g, "-")}-${today()}.xlsx`,
+    `${id ? "Laporan" : "Report"}-${(D().event || "Acara").replace(/\s+/g, "-")}-${refDate || today()}.xlsx`,
   );
   await mutate(() => {}, "actExport", D().event + " · " + rp(s.net));
   toast(t("xls"));
 }
+Object.assign(window, {
+  createFirst,
+  doSignIn,
+  doSignUp,
+  doGoogle,
+  doForgot,
+  doSignOut,
+  googleFlow,
+  setLang,
+  toggleTheme,
+  go,
+  setAuthMode,
+  setPanel,
+  setFilter,
+  setAdminTab,
+  onLogSearch,
+  setTxSort,
+  onTxSearch,
+  openTx,
+  saveTx,
+  delTx,
+  verify,
+  setType,
+  recalc,
+  stepSeats,
+  prev,
+  onProofChange,
+  viewProof,
+  viewProofPreview,
+  viewProofById,
+  closeSheet,
+  openImport,
+  dlTemplate,
+  commitImport,
+  openMe,
+  stopImp,
+  openUser,
+  saveUser,
+  delUser,
+  startImp,
+  saveSet,
+  editCat,
+  editTpl,
+  addCustomCol,
+  delTplCol,
+  addCat,
+  delCat,
+  resetAll,
+  openExportPeriod,
+  setExportKind,
+  updateExportPreview,
+  doExportExcel,
+  exportLogs,
+  toggleEye,
+});
 boot();
