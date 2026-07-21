@@ -22,6 +22,7 @@
   --ink: #1a1a18;
   --hdr: 56px;
   --nav: 66px;
+  --banner: 0px;
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 :root[data-theme="dark"] {
@@ -585,7 +586,7 @@ nav button.on .dot {
   scrollbar-width: thin;
 }
 .fit {
-  height: calc(100dvh - var(--hdr) - var(--nav));
+  height: calc(100dvh - var(--hdr) - var(--nav) - var(--banner));
   display: flex;
   flex-direction: column;
   gap: 10px;

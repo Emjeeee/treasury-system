@@ -10,8 +10,46 @@ async function loadExcelJS() {
 }
 
 /* ================= penyimpanan ================= */
-const SKEY = "ct_shared_v4",
-  LKEY = "ct_session_v4";
+// prefix isolasi untuk verifikasi/testing, jangan pernah sentuh key produksi
+const KEY_PREFIX = import.meta.env.VITE_KEY_PREFIX || "";
+const SKEY = KEY_PREFIX + "ct_shared_v4",
+  HKEY = KEY_PREFIX + "ct_events_index_v1",
+  LKEY = KEY_PREFIX + "ct_session_v4";
+const eventKey = (id) => KEY_PREFIX + "ct_event_" + id + "_v1";
+const DEFAULT_TPL = [
+  { f: "no", h: "No" },
+  { f: "name", h: "Nama" },
+  { f: "phone", h: "No. WhatsApp" },
+  { f: "type", h: "Jenis" },
+  { f: "cat", h: "Kategori" },
+  { f: "seats", h: "Jumlah Kursi" },
+  { f: "debit", h: "Debit (Rp)" },
+  { f: "credit", h: "Kredit (Rp)" },
+  { f: "bank", h: "Rekening" },
+  { f: "status", h: "Status" },
+  { f: "note", h: "Catatan" },
+  { f: "date", h: "Tanggal" },
+];
+const CASH_DENOMS = [100000, 50000, 20000, 10000, 5000, 2000, 1000];
+// id statis (bukan uid()) supaya bisa dipanggil saat modul dimuat, sebelum
+// uid() sendiri didefinisikan lebih bawah di file ini
+const DEFAULT_METHODS = () => [
+  { id: "m_bca", name: "BCA", type: "bank" },
+  { id: "m_livin", name: "Livin Mandiri", type: "bank" },
+  { id: "m_bri", name: "BRI", type: "bank" },
+  { id: "m_tunai", name: "Tunai", type: "cash" },
+];
+// ubah config.banks (daftar nama string, versi lama) jadi config.methods
+// (daftar {id,name,type}) - dipanggil begitu acara dimuat, sekali per acara
+function methodsFromBanks(banks) {
+  return (banks || []).map((name) => ({
+    id: uid(),
+    name,
+    type: /tunai|cash/i.test(name) ? "cash" : "bank",
+  }));
+}
+// S = data acara yang sedang dibuka (config+tx+logs). G = data lintas-acara
+// (daftar acara, daftar pengguna) di baris kv_store terpisah (HKEY).
 let S = {
   rev: 0,
   config: {
@@ -21,27 +59,14 @@ let S = {
       { n: "Reguler", p: 150000, q: 300 },
       { n: "VIP", p: 400000, q: 80 },
     ],
-    banks: ["BCA", "Livin Mandiri", "BRI", "Tunai"],
-    tpl: [
-      { f: "no", h: "No" },
-      { f: "name", h: "Nama" },
-      { f: "phone", h: "No. WhatsApp" },
-      { f: "type", h: "Jenis" },
-      { f: "cat", h: "Kategori" },
-      { f: "seats", h: "Jumlah Kursi" },
-      { f: "debit", h: "Debit (Rp)" },
-      { f: "credit", h: "Kredit (Rp)" },
-      { f: "bank", h: "Rekening" },
-      { f: "status", h: "Status" },
-      { f: "note", h: "Catatan" },
-      { f: "date", h: "Tanggal" },
-    ],
+    methods: DEFAULT_METHODS(),
+    tpl: DEFAULT_TPL,
   },
   tx: [],
-  users: [],
   logs: [],
-  resets: [],
 };
+let G = { rev: 0, events: [], users: [], logs: [] };
+let currentEventId = null;
 let me = null,
   imp = null,
   lang = "id",
@@ -50,14 +75,29 @@ let screen = "boot",
   tab = "dash",
   filter = "all",
   panel = "seats",
-  adminTab = "users",
+  adminTab = "set",
+  hubTab = "events",
   authMode = "in";
 let chart1 = null,
   pendingImp = [],
   logQ = "",
   txQ = "",
   txSort = { k: "date", dir: "desc" },
-  exportKind = "week";
+  exportKind = "week",
+  monitorCache = null;
+let txPage = 1,
+  logPage = 1,
+  boardBuyPage = 1,
+  boardDonPage = 1,
+  hubEventsPage = 1,
+  hubEventsQ = "",
+  hubEventsFilter = "all",
+  hubEventsSort = { k: "name", dir: "asc" },
+  hubStaffPage = 1,
+  hubStaffQ = "",
+  hubStaffFilter = "all",
+  hubStaffSort = { k: "name", dir: "asc" };
+const PAGE_SIZE = 20;
 
 const D = () => S.config;
 const rp = (n) => "Rp " + (Math.round(n) || 0).toLocaleString("id-ID");
@@ -81,6 +121,21 @@ const narrow = () => window.innerWidth < 960;
 const now = () => new Date().toISOString();
 const acting = () => imp || me; // identitas yang sedang dipakai
 const isAdmin = () => me && me.role === "admin" && !imp; // hak admin hilang saat menyamar
+// potong array jadi satu halaman (dipakai semua tampilan list: transaksi,
+// log, peringkat, acara, staff) supaya tidak perlu scroll ratusan baris
+function paginate(arr, page, size = PAGE_SIZE) {
+  const totalPages = Math.max(1, Math.ceil(arr.length / size));
+  const p = Math.min(Math.max(1, page), totalPages);
+  return { items: arr.slice((p - 1) * size, p * size), page: p, totalPages, total: arr.length };
+}
+function pagerHtml(page, totalPages, setter) {
+  if (totalPages <= 1) return "";
+  return `<div class="rowsp" style="margin-top:10px;flex:none;justify-content:center;gap:14px">
+    <button class="btn ghost sm icon" ${page <= 1 ? "disabled" : ""} onclick="${setter}(${page - 1})" aria-label="prev">‹</button>
+    <span class="hint mono">${page} / ${totalPages}</span>
+    <button class="btn ghost sm icon" ${page >= totalPages ? "disabled" : ""} onclick="${setter}(${page + 1})" aria-label="next">›</button>
+  </div>`;
+}
 
 async function sha(s) {
   const b = await crypto.subtle.digest(
@@ -91,9 +146,21 @@ async function sha(s) {
     .map((x) => x.toString(16).padStart(2, "0"))
     .join("");
 }
-async function pull() {
+function logEntry(act, det) {
+  return {
+    ts: now(),
+    user: acting().name,
+    email: acting().email,
+    role: acting().role,
+    asAdmin: imp ? me.email : "",
+    act,
+    det: det || "",
+  };
+}
+async function pullEvent() {
+  if (!currentEventId) return false;
   try {
-    const r = await window.storage.get(SKEY, true);
+    const r = await window.storage.get(eventKey(currentEventId), true);
     if (r && r.value) {
       const v = JSON.parse(r.value);
       if (v.rev !== S.rev) {
@@ -102,40 +169,77 @@ async function pull() {
       }
     }
   } catch (e) {
-    console.error("pull() failed:", e);
+    console.error("pullEvent() failed:", e);
   }
   return false;
 }
-async function push() {
+async function pushEvent() {
+  if (!currentEventId) return;
   S.rev = (S.rev || 0) + 1;
   try {
-    await window.storage.set(SKEY, JSON.stringify(S), true);
+    await window.storage.set(eventKey(currentEventId), JSON.stringify(S), true);
   } catch (e) {
-    console.error("push() failed:", e);
+    console.error("pushEvent() failed:", e);
     toast("⚠ " + t("saveErr"));
   }
 }
-async function mutate(fn, logAct, logDet) {
+async function mutateEvent(fn, logAct, logDet) {
   try {
-    const r = await window.storage.get(SKEY, true);
+    const r = await window.storage.get(eventKey(currentEventId), true);
     if (r && r.value) S = Object.assign(S, JSON.parse(r.value));
   } catch (e) {
-    console.error("mutate() pre-fetch failed:", e);
+    console.error("mutateEvent() pre-fetch failed:", e);
   }
   fn();
   if (logAct) {
-    S.logs.unshift({
-      ts: now(),
-      user: acting().name,
-      email: acting().email,
-      role: acting().role,
-      asAdmin: imp ? me.email : "",
-      act: logAct,
-      det: logDet || "",
-    });
+    S.logs.unshift(logEntry(logAct, logDet));
     S.logs = S.logs.slice(0, 600);
   }
-  await push();
+  await pushEvent();
+}
+// pull/push/mutate tetap dipakai di seluruh kode yang mengubah data acara
+// yang sedang dibuka (transaksi, pengaturan, log acara itu) - tidak perlu
+// diganti satu per satu, cukup alias ke versi *Event di atas.
+const pull = pullEvent,
+  push = pushEvent,
+  mutate = mutateEvent;
+async function pullHub() {
+  try {
+    const r = await window.storage.get(HKEY, true);
+    if (r && r.value) {
+      const v = JSON.parse(r.value);
+      if (v.rev !== G.rev) {
+        G = Object.assign(G, v);
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error("pullHub() failed:", e);
+  }
+  return false;
+}
+async function pushHub() {
+  G.rev = (G.rev || 0) + 1;
+  try {
+    await window.storage.set(HKEY, JSON.stringify(G), true);
+  } catch (e) {
+    console.error("pushHub() failed:", e);
+    toast("⚠ " + t("saveErr"));
+  }
+}
+async function mutateHub(fn, logAct, logDet) {
+  try {
+    const r = await window.storage.get(HKEY, true);
+    if (r && r.value) G = Object.assign(G, JSON.parse(r.value));
+  } catch (e) {
+    console.error("mutateHub() pre-fetch failed:", e);
+  }
+  fn();
+  if (logAct) {
+    G.logs.unshift(logEntry(logAct, logDet));
+    G.logs = G.logs.slice(0, 600);
+  }
+  await pushHub();
 }
 async function saveSession() {
   try {
@@ -146,10 +250,111 @@ async function saveSession() {
         imp: imp ? imp.email : "",
         lang,
         theme,
+        eventId: currentEventId,
       }),
       false,
     );
   } catch (e) {}
+}
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+async function ensureMigrated() {
+  const idx = await window.storage.get(HKEY, true);
+  if (idx && idx.value) return; // sudah dimigrasi (atau instalasi baru multi-acara)
+
+  const old = await window.storage.get(SKEY, true);
+  if (!old || !old.value) {
+    // instalasi baru, belum ada data lama sama sekali
+    await window.storage.set(
+      HKEY,
+      JSON.stringify({ rev: 1, events: [], users: [], logs: [] }),
+      true,
+    );
+    return;
+  }
+
+  const legacy = JSON.parse(old.value);
+  // 1. backup sisi server (jaring pengaman utama)
+  await window.storage.set(
+    KEY_PREFIX + "ct_backup_pre_migration_v1",
+    JSON.stringify({ backedUpAt: now(), source: SKEY, data: legacy }),
+    true,
+  );
+  // 1b. unduhan lokal (bonus, bisa diblokir browser mobile, bukan jaring pengaman utama)
+  try {
+    downloadJSON(legacy, `Backup-PreMigration-${today()}.json`);
+  } catch (e) {}
+
+  // 2. id acara deterministik: kalau ada 2 client migrasi bersamaan, hasilnya sama
+  const EVID = "ev_default";
+  await window.storage.set(
+    eventKey(EVID),
+    JSON.stringify({
+      rev: 1,
+      config: {
+        event: legacy.config.event,
+        date: legacy.config.date,
+        cats: legacy.config.cats,
+        methods: methodsFromBanks(legacy.config.banks),
+        tpl: legacy.config.tpl,
+      },
+      tx: legacy.tx || [],
+      logs: legacy.logs || [],
+    }),
+    true,
+  );
+
+  // 3. baris index ditulis TERAKHIR - keberadaannya adalah penanda "sudah dimigrasi"
+  const users = (legacy.users || []).map((u) => ({
+    ...u,
+    eventIds: u.role === "admin" ? [] : [EVID],
+  }));
+  await window.storage.set(
+    HKEY,
+    JSON.stringify({
+      rev: 1,
+      events: [
+        {
+          id: EVID,
+          name: legacy.config.event,
+          date: legacy.config.date,
+          status: "active",
+          createdAt: now(),
+          createdBy: "system-migration",
+        },
+      ],
+      users,
+      logs: [],
+    }),
+    true,
+  );
+  // baris lama ct_shared_v4 sengaja dibiarkan apa adanya sebagai cadangan tambahan
+}
+// buat baris acara baru yang masih kosong (dipakai saat setup akun admin
+// pertama, dan nanti oleh Konsol Admin untuk menambah acara baru)
+async function createEventRow(id, name, date, createdBy) {
+  await window.storage.set(
+    eventKey(id),
+    JSON.stringify({
+      rev: 1,
+      config: { event: name, date: date || "", cats: [], methods: [], tpl: DEFAULT_TPL },
+      tx: [],
+      logs: [],
+    }),
+    true,
+  );
+  return { id, name, date: date || "", status: "active", createdAt: now(), createdBy };
 }
 const closeIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
 const closeBtn = () =>
@@ -228,12 +433,12 @@ const L = {
     noFileChosen: "Tidak ada berkas dipilih",
     fileAttached: "Gambar terpasang",
     viewProof: "Lihat bukti",
-    destAcc: "No. rekening tujuan",
     searchTx: "Cari nama, telepon, catatan, rekening...",
     status: "Status uang",
     stW: "Menunggu cek mutasi",
     stV: "Sudah masuk rekening",
     save: "Simpan transaksi",
+    saveGeneric: "Simpan",
     del: "Hapus",
     saved: "Transaksi tersimpan",
     deleted: "Transaksi dihapus",
@@ -242,7 +447,19 @@ const L = {
     event: "Acara",
     evName: "Nama acara",
     evDate: "Tanggal acara",
-    bankList: "Rekening / metode pembayaran (pisahkan dengan koma)",
+    methods: "Metode pembayaran",
+    methodName: "Nama",
+    methodType: "Tipe",
+    methodBank: "Transfer Bank",
+    methodCash: "Tunai",
+    methodCheque: "Cek",
+    methodOther: "Lainnya",
+    addMethod: "+ Tambah metode",
+    cashBreakdown: "Rincian pecahan uang",
+    cashTotal: "Total tunai",
+    chequeNo: "No. cek",
+    chequeBank: "Bank penerbit",
+    chequeDate: "Tanggal cair",
     saveSet: "Simpan pengaturan",
     setSaved: "Pengaturan disimpan",
     catTitle: "Kategori kursi",
@@ -362,6 +579,26 @@ const L = {
     perAll: "Semua data",
     perDate: "Tanggal acuan",
     perAllLabel: "Semua periode",
+    adminConsole: "Konsol Admin",
+    events: "Acara",
+    staff: "Staff",
+    monitoring: "Monitoring",
+    newEvent: "+ Acara baru",
+    archive: "Arsipkan",
+    restore: "Aktifkan lagi",
+    archived: "Diarsipkan",
+    chooseEvent: "Pilih acara",
+    chooseEventSub: "Anda dipetakan ke beberapa acara. Pilih salah satu untuk mulai.",
+    switchEvent: "Ganti acara",
+    noEventsAssigned: "Belum ada acara yang ditugaskan ke Anda. Hubungi admin.",
+    needsAttention: "Perlu perhatian",
+    staffPerformance: "Performa staff",
+    enterWorkspace: "Buka",
+    backToConsole: "Kembali ke Konsol Admin",
+    financialSummary: "Ringkasan keuangan",
+    recorded: "Dicatat",
+    refresh: "Segarkan",
+    verified: "Diverifikasi",
   },
   en: {
     dash: "Dashboard",
@@ -425,12 +662,12 @@ const L = {
     noFileChosen: "No file chosen",
     fileAttached: "Image attached",
     viewProof: "View proof",
-    destAcc: "Destination account no.",
     searchTx: "Search name, phone, note, account...",
     status: "Payment status",
     stW: "Awaiting bank check",
     stV: "Received in account",
     save: "Save transaction",
+    saveGeneric: "Save",
     del: "Delete",
     saved: "Transaction saved",
     deleted: "Transaction deleted",
@@ -439,7 +676,19 @@ const L = {
     event: "Event",
     evName: "Event name",
     evDate: "Event date",
-    bankList: "Accounts / payment methods (comma separated)",
+    methods: "Payment methods",
+    methodName: "Name",
+    methodType: "Type",
+    methodBank: "Bank Transfer",
+    methodCash: "Cash",
+    methodCheque: "Cheque",
+    methodOther: "Other",
+    addMethod: "+ Add method",
+    cashBreakdown: "Cash denomination breakdown",
+    cashTotal: "Cash total",
+    chequeNo: "Cheque no.",
+    chequeBank: "Issuing bank",
+    chequeDate: "Clearing date",
     saveSet: "Save settings",
     setSaved: "Settings saved",
     catTitle: "Seat categories",
@@ -558,6 +807,26 @@ const L = {
     perAll: "All data",
     perDate: "Reference date",
     perAllLabel: "All time",
+    adminConsole: "Admin Console",
+    events: "Events",
+    staff: "Staff",
+    monitoring: "Monitoring",
+    newEvent: "+ New event",
+    archive: "Archive",
+    restore: "Restore",
+    archived: "Archived",
+    chooseEvent: "Choose an event",
+    chooseEventSub: "You're mapped to more than one event. Pick one to get started.",
+    switchEvent: "Switch event",
+    noEventsAssigned: "No events assigned to you yet. Contact your admin.",
+    needsAttention: "Needs attention",
+    staffPerformance: "Staff performance",
+    enterWorkspace: "Open",
+    backToConsole: "Back to Admin Console",
+    financialSummary: "Financial summary",
+    recorded: "Recorded",
+    refresh: "Refresh",
+    verified: "Verified",
   },
 };
 const t = (k, v = {}) =>
@@ -574,14 +843,13 @@ const FL = {
   credit: { id: "Kredit (Rp)", en: "Credit (Rp)" },
   amount: { id: "Nominal", en: "Amount" },
   bank: { id: "Rekening", en: "Account" },
-  destAcc: { id: "No. Rekening Tujuan", en: "Destination Account No." },
   status: { id: "Status", en: "Status" },
   note: { id: "Catatan", en: "Note" },
 };
 
 /* ================= hitung ================= */
-function sums() {
-  const v = S.tx.filter((x) => x.status === "verified");
+function sums(tx = S.tx, cats = D().cats) {
+  const v = tx.filter((x) => x.status === "verified");
   const inTicket = v
     .filter((x) => x.type === "ticket")
     .reduce((a, b) => a + b.amount, 0);
@@ -591,8 +859,8 @@ function sums() {
   const exp = v
     .filter((x) => x.type === "expense")
     .reduce((a, b) => a + b.amount, 0);
-  const pd = S.tx.filter((x) => x.status === "pending" && x.type !== "expense");
-  const quota = D().cats.reduce((a, c) => a + (+c.q || 0), 0);
+  const pd = tx.filter((x) => x.status === "pending" && x.type !== "expense");
+  const quota = cats.reduce((a, c) => a + (+c.q || 0), 0);
   const sold = v
     .filter((x) => x.type !== "expense")
     .reduce((a, b) => a + (+b.seats || 0), 0);
@@ -626,9 +894,9 @@ function seriesByDay(d) {
   }
   return o;
 }
-function byPerson(ty) {
+function byPerson(ty, tx = S.tx) {
   const m = {};
-  S.tx
+  tx
     .filter(
       (x) =>
         x.status === "verified" && (ty ? x.type === ty : x.type !== "expense"),
@@ -644,43 +912,102 @@ function byPerson(ty) {
 }
 
 /* ================= boot & sinkronisasi ================= */
+function myEvents(user) {
+  if (!user) return [];
+  return user.role === "admin"
+    ? G.events.filter((e) => e.status === "active")
+    : G.events.filter(
+        (e) => e.status === "active" && (user.eventIds || []).includes(e.id),
+      );
+}
+async function enterEvent(id) {
+  currentEventId = id;
+  // rev:0 tak pernah dipakai baris sungguhan (mulai dari 1), jadi pullEvent()
+  // di bawah selalu menimpa S dengan data acara yang baru, tidak pernah
+  // "dikira sama" dan dilewati gara-gara kebetulan rev acara lama == acara baru
+  S = {
+    rev: 0,
+    config: { event: "", date: "", cats: [], methods: [], tpl: DEFAULT_TPL },
+    tx: [],
+    logs: [],
+  };
+  await pullEvent();
+  await normalizeEventConfig();
+}
+// acara lama (sebelum config.methods ada) masih pakai config.banks (array
+// nama string) - ubah ke methods sekali saat acara itu pertama kali dibuka
+// lagi, lalu simpan supaya tidak perlu dikonversi ulang tiap kali
+async function normalizeEventConfig() {
+  if (S.config.methods) return;
+  const methods = methodsFromBanks(S.config.banks);
+  await mutateEvent(() => {
+    S.config.methods = methods;
+    delete S.config.banks;
+  }, null);
+}
+// keputusan layar mana yang dibuka setelah login/impersonate/reload:
+// - acara tersimpan di sesi masih valid -> lanjutkan di situ
+// - staff dengan tepat 1 acara -> langsung masuk, tanpa perlu memilih
+// - admin tanpa acara tersimpan -> Konsol Admin
+// - selain itu (staff 0 atau 2+ acara) -> layar pilih acara
+function resolveEventEntry(user, savedEventId) {
+  const avail = myEvents(user);
+  const saved = avail.find((e) => e.id === savedEventId);
+  if (saved) return { screen: "app", eventId: saved.id };
+  // admin selalu mendarat di Konsol Admin dulu (kecuali sesi tersimpan di atas
+  // sudah mengarah ke satu acara) - beda dari staff yang auto-masuk kalau
+  // acaranya cuma satu
+  if (user.role === "admin") return { screen: "hub", eventId: null };
+  if (avail.length === 1) return { screen: "app", eventId: avail[0].id };
+  return { screen: "picker", eventId: null };
+}
+async function enterResolved(user, savedEventId) {
+  const r = resolveEventEntry(user, savedEventId);
+  if (r.eventId) await enterEvent(r.eventId);
+  else currentEventId = null;
+  screen = r.screen;
+}
 async function boot() {
+  await ensureMigrated();
+  await pullHub();
+  let savedEventId = null;
   try {
     const r = await window.storage.get(LKEY, false);
-    await pull();
     if (r && r.value) {
       const v = JSON.parse(r.value);
       lang = v.lang || "id";
       theme = v.theme || "light";
-      me = S.users.find((u) => u.email === v.email && u.active) || null;
-      if (me && v.imp) imp = S.users.find((u) => u.email === v.imp) || null;
+      me = G.users.find((u) => u.email === v.email && u.active) || null;
+      if (me && v.imp) imp = G.users.find((u) => u.email === v.imp) || null;
+      savedEventId = v.eventId || null;
     }
-  } catch (e) {
-    await pull();
-  }
+  } catch (e) {}
   applyTheme();
-  if (!S.users.length) {
+  if (!G.users.length) {
     screen = "setup";
   } else if (!me) {
     screen = "auth";
   } else {
-    screen = "app";
+    await enterResolved(acting(), savedEventId);
   }
   render();
   setInterval(async () => {
-    if (screen !== "app") return;
-    const ch = await pull();
-    if (ch) {
+    if (screen === "app") {
+      const ch = await pullEvent();
+      await pullHub();
       if (me) {
-        const u = S.users.find((x) => x.email === me.email);
+        const u = G.users.find((x) => x.email === me.email);
         if (!u || !u.active) {
           await doSignOut(true);
           return;
         }
         me = u;
-        if (imp) imp = S.users.find((x) => x.email === imp.email) || null;
+        if (imp) imp = G.users.find((x) => x.email === imp.email) || null;
       }
-      render();
+      if (ch) render();
+    } else if (screen === "picker" || screen === "hub") {
+      const ch = await pullHub();
+      if (ch) render();
     }
   }, 6000);
 }
@@ -696,8 +1023,17 @@ function render() {
   const r = document.getElementById("root");
   if (screen === "setup") r.innerHTML = vSetup();
   else if (screen === "auth") r.innerHTML = vAuth();
+  else if (screen === "picker") r.innerHTML = vPicker();
+  else if (screen === "hub") r.innerHTML = vHub();
   else {
     r.innerHTML = vApp();
+    // .fit (dashboard) mengurangi tinggi viewport dengan --banner supaya tidak
+    // tabrakan dengan nav bawah saat banner "Viewing as" sedang tampil
+    const bannerEl = r.querySelector(".banner");
+    document.documentElement.style.setProperty(
+      "--banner",
+      (bannerEl ? bannerEl.offsetHeight : 0) + "px",
+    );
     if (tab === "dash") drawChart();
   }
 }
@@ -771,16 +1107,22 @@ async function createFirst() {
     rec: await sha(e + rc.toUpperCase()),
     created: now(),
     last: now(),
+    eventIds: [],
   };
   me = u;
   imp = null;
-  await mutate(
-    () => {
-      S.users.push(u);
-    },
-    "actSignup",
-    "admin " + e,
+  const eventEntry = await createEventRow(
+    "ev_" + uid(),
+    lang === "id" ? "Acara Pertama" : "First Event",
+    "",
+    e,
   );
+  await mutateHub(() => {
+    G.users.push(u);
+    G.events.push(eventEntry);
+  }, "actSignup", "admin " + e);
+  currentEventId = eventEntry.id;
+  await pullEvent();
   await saveSession();
   screen = "app";
   render();
@@ -837,21 +1179,16 @@ function gIcon() {
 async function doSignIn() {
   const e = val("i_email").toLowerCase(),
     p = val("i_pass");
-  await pull();
-  const u = S.users.find((x) => x.email === e && x.active);
+  await pullHub();
+  const u = G.users.find((x) => x.email === e && x.active);
   if (!u || u.pass !== (await sha(e + p))) return toast(t("badLogin"));
   me = u;
   imp = null;
-  await mutate(
-    () => {
-      const x = S.users.find((v) => v.email === e);
-      x.last = now();
-    },
-    "actLogin",
-    "",
-  );
+  await mutateHub(() => {
+    G.users.find((v) => v.email === e).last = now();
+  }, "actLogin", "");
+  await enterResolved(me, null);
   await saveSession();
-  screen = "app";
   tab = "dash";
   render();
   toast(t("hello", { n: u.name }));
@@ -865,8 +1202,8 @@ async function doSignUp() {
   if (!n || !e || !p || !rc) return toast(t("fillAll"));
   if (p.length < 8) return toast(t("passShort"));
   if (p !== p2) return toast(t("passDiff"));
-  await pull();
-  if (S.users.some((x) => x.email === e)) return toast(t("emailUsed"));
+  await pullHub();
+  if (G.users.some((x) => x.email === e)) return toast(t("emailUsed"));
   const u = {
     id: uid(),
     name: n,
@@ -878,16 +1215,13 @@ async function doSignUp() {
     rec: await sha(e + rc.toUpperCase()),
     created: now(),
     last: now(),
+    eventIds: [],
   };
   me = u;
   imp = null;
-  await mutate(
-    () => {
-      S.users.push(u);
-    },
-    "actSignup",
-    e,
-  );
+  await mutateHub(() => {
+    G.users.push(u);
+  }, "actSignup", e);
   await saveSession();
   screen = "app";
   render();
@@ -905,18 +1239,14 @@ async function doGoogle() {
   const e = val("g_email").toLowerCase(),
     n = val("g_name") || e.split("@")[0];
   if (!e) return toast(t("fillAll"));
-  await pull();
-  let u = S.users.find((x) => x.email === e);
+  await pullHub();
+  let u = G.users.find((x) => x.email === e);
   if (u) {
     if (!u.active) return toast(t("badLogin"));
     me = u;
-    await mutate(
-      () => {
-        S.users.find((v) => v.email === e).last = now();
-      },
-      "actLogin",
-      "Google",
-    );
+    await mutateHub(() => {
+      G.users.find((v) => v.email === e).last = now();
+    }, "actLogin", "Google");
   } else {
     u = {
       id: uid(),
@@ -929,20 +1259,17 @@ async function doGoogle() {
       rec: "",
       created: now(),
       last: now(),
+      eventIds: [],
     };
     me = u;
-    await mutate(
-      () => {
-        S.users.push(u);
-      },
-      "actSignup",
-      e + " · Google",
-    );
+    await mutateHub(() => {
+      G.users.push(u);
+    }, "actSignup", e + " · Google");
   }
   imp = null;
+  await enterResolved(me, null);
   closeSheet();
   await saveSession();
-  screen = "app";
   render();
   toast(t("hello", { n: me.name }));
 }
@@ -951,22 +1278,23 @@ async function doForgot() {
     rc = val("r_rec").toUpperCase(),
     p = val("r_pass");
   if (p.length < 8) return toast(t("passShort"));
-  await pull();
-  const u = S.users.find((x) => x.email === e);
+  await pullHub();
+  const u = G.users.find((x) => x.email === e);
   if (!u || !u.rec || u.rec !== (await sha(e + rc)))
     return toast(t("badRecov"));
   const h = await sha(e + p);
-  await mutate(() => {
-    S.users.find((v) => v.email === e).pass = h;
+  await mutateHub(() => {
+    G.users.find((v) => v.email === e).pass = h;
   }, null);
   toast(t("passReset"));
   authMode = "in";
   render();
 }
 async function doSignOut(silent) {
-  if (!silent) await mutate(() => {}, "actLogout", "");
+  if (!silent) await mutateHub(() => {}, "actLogout", "");
   me = null;
   imp = null;
+  currentEventId = null;
   await saveSession();
   screen = "auth";
   authMode = "in";
@@ -990,6 +1318,265 @@ function recoveryCode() {
     .join("")
     .toUpperCase()
     .replace(/(.{4})(.{4})/, "$1-$2"); // contoh: 3F9A-1C0B
+}
+
+/* ================= pemilih acara & konsol admin ================= */
+function vPicker() {
+  const events = myEvents(acting());
+  return `<div class="auth"><div class="authbox">
+  <div class="rowsp" style="margin-bottom:14px;flex-wrap:wrap;row-gap:10px"><div style="display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 auto">
+    <div class="mark">TS</div><div style="min-width:0"><h1 style="font-size:19px">${t("chooseEvent")}</h1>
+    <div class="hint">${t("chooseEventSub")}</div></div></div>
+    <div style="display:flex;gap:6px;align-items:center;flex:none">${themeBtn()}${langSeg()}</div></div>
+  <div class="card" style="padding:16px">
+    ${
+      events.length
+        ? events
+            .map(
+              (e) => `<button class="btn ghost wide" style="display:flex;flex-direction:column;align-items:flex-start;gap:2px;margin-bottom:8px;padding:14px 16px" onclick="switchEvent('${e.id}')">
+        <span style="font-weight:700;font-size:16px">${esc(e.name)}</span>
+        ${e.date ? `<span class="hint">${esc(e.date)}</span>` : ""}
+      </button>`,
+            )
+            .join("")
+        : `<div class="empty">${t("noEventsAssigned")}</div>`
+    }
+    <button class="btn danger wide" style="margin-top:8px" onclick="doSignOut()">${t("signOut")}</button>
+  </div>${copyrightLine()}</div></div>`;
+}
+async function switchEvent(id) {
+  await enterEvent(id);
+  tab = "dash";
+  filter = "all";
+  txQ = "";
+  logQ = "";
+  await saveSession();
+  closeSheet();
+  screen = "app";
+  render();
+}
+function goHub() {
+  closeSheet();
+  currentEventId = null;
+  screen = "hub";
+  saveSession();
+  render();
+}
+function setHubTab(k) {
+  // keluar dari tab Monitoring membuang cache-nya, supaya lain kali dibuka
+  // datanya segar lagi (bukan sisa sebelum ada perubahan acara/staff)
+  if (hubTab === "monitor" && k !== "monitor") monitorCache = null;
+  hubTab = k;
+  render();
+}
+function vHub() {
+  const a = acting();
+  return `<header><div class="wrap">
+    <div class="mark">TS</div>
+    <div style="flex:1;min-width:0"><h1 style="font-size:17px">${t("adminConsole")}</h1></div>
+    ${themeBtn()}
+    ${langSeg()}
+    <div class="avatar" onclick="openMe()" title="${esc(a.name)}">${esc(a.name.slice(0, 1).toUpperCase())}</div>
+  </div></header>
+  <div class="wrap" style="padding:12px 0 50px">
+    <div class="seg" style="margin-bottom:12px">${[
+      ["events", t("events")],
+      ["staff", t("staff")],
+      ["monitor", t("monitoring")],
+    ]
+      .map(
+        ([k, l]) =>
+          `<button class="${hubTab === k ? "on" : ""}" onclick="setHubTab('${k}')">${l}</button>`,
+      )
+      .join("")}</div>
+    ${
+      hubTab === "monitor" && !monitorCache
+        ? (loadMonitor(), `<div class="empty">${t("noneYet")}</div>`)
+        : { events: vHubEvents, staff: vHubStaff, monitor: vHubMonitor }[hubTab]()
+    }
+  </div>`;
+}
+function vHubEvents() {
+  const q = hubEventsQ.toLowerCase();
+  let all = G.events.filter(
+    (e) =>
+      (hubEventsFilter === "all" || e.status === hubEventsFilter) &&
+      (!q || (e.name + " " + (e.date || "")).toLowerCase().includes(q)),
+  );
+  const { k, dir } = hubEventsSort,
+    mul = dir === "asc" ? 1 : -1;
+  all = all.slice().sort((a, b) => {
+    const av = String(a[k] ?? "").toLowerCase(),
+      bv = String(b[k] ?? "").toLowerCase();
+    return av > bv ? mul : av < bv ? -mul : 0;
+  });
+  const { items, page, totalPages } = paginate(all, hubEventsPage, 10);
+  const si = (k) =>
+    hubEventsSort.k === k ? (hubEventsSort.dir === "asc" ? " ▲" : " ▼") : "";
+  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="font-size:17px">${t("events")}</h2>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
+      <div class="chips">${[
+        ["all", t("all")],
+        ["active", t("active")],
+        ["archived", t("archived")],
+      ]
+        .map(
+          ([k2, l]) =>
+            `<button class="chip ${hubEventsFilter === k2 ? "on" : ""}" onclick="setHubEventsFilter('${k2}')">${l}</button>`,
+        )
+        .join("")}</div>
+      <input style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(hubEventsQ)}" oninput="onHubEventsSearch(this.value)">
+      <button class="btn sm" onclick="openNewEvent()">${t("newEvent")}</button></div></div>
+    <div style="overflow-x:auto"><table><thead><tr>
+      <th class="sortable" onclick="setHubEventsSort('name')">${t("name")}${si("name")}</th>
+      <th class="sortable" onclick="setHubEventsSort('date')">${t("evDate")}${si("date")}</th>
+      <th class="sortable" onclick="setHubEventsSort('status')">${t("status")}${si("status")}</th>
+      <th></th></tr></thead><tbody>
+    ${
+      items.length
+        ? items
+            .map(
+              (e) => `<tr>
+      <td style="font-weight:600">${esc(e.name)}</td>
+      <td class="hint mono">${e.date || "-"}</td>
+      <td><span class="tag ${e.status === "active" ? "t-ok" : "t-exp"}">${e.status === "active" ? t("active") : t("archived")}</span></td>
+      <td style="text-align:right;white-space:nowrap">
+        ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button> ` : ""}
+        <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
+      </td></tr>`,
+            )
+            .join("")
+        : `<tr><td colspan="4" class="empty">${t("noneYet")}</td></tr>`
+    }
+    </tbody></table></div>${pagerHtml(page, totalPages, "setHubEventsPage")}</div>`;
+}
+function setHubEventsSort(k) {
+  hubEventsSort =
+    hubEventsSort.k === k
+      ? { k, dir: hubEventsSort.dir === "asc" ? "desc" : "asc" }
+      : { k, dir: "asc" };
+  hubEventsPage = 1;
+  render();
+}
+function openNewEvent() {
+  sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${t("newEvent")}</h2>${closeBtn()}</div>
+    <div class="field"><label>${t("evName")}</label><input id="ne_name"></div>
+    <div class="field"><label>${t("evDate")}</label><input type="date" id="ne_date"></div>
+    <button class="btn wide" onclick="createEventSubmit()">${t("saveGeneric")}</button>`);
+}
+async function createEventSubmit() {
+  const name = val("ne_name"),
+    date = val("ne_date");
+  if (!name) return toast(t("fillAll"));
+  const entry = await createEventRow("ev_" + uid(), name, date, acting().email);
+  await mutateHub(() => {
+    G.events.push(entry);
+  }, "actEventCreate", name);
+  closeSheet();
+  toast(t("saved"));
+  render();
+}
+async function toggleArchive(id) {
+  const e = G.events.find((x) => x.id === id);
+  const next = e.status === "active" ? "archived" : "active";
+  await mutateHub(() => {
+    G.events.find((x) => x.id === id).status = next;
+  }, "actEventArchive", e.name + " -> " + next);
+  render();
+}
+// mengambil data tiap acara sekaligus, hanya saat tab Monitoring dibuka -
+// bukan polling, supaya tidak membaca semua acara tiap 6 detik
+async function loadMonitor() {
+  const rows = await Promise.all(
+    G.events.map(async (e) => {
+      const r = await window.storage.get(eventKey(e.id), true);
+      const data =
+        r && r.value ? JSON.parse(r.value) : { config: { cats: [] }, tx: [], logs: [] };
+      return { event: e, data };
+    }),
+  );
+  monitorCache = {
+    perEvent: rows.map(({ event, data }) => ({
+      event,
+      sums: sums(data.tx, data.config.cats),
+    })),
+    pending: rows
+      .flatMap(({ event, data }) =>
+        data.tx
+          .filter((x) => x.status === "pending")
+          .map((x) => ({ ...x, eventId: event.id, eventName: event.name })),
+      )
+      .sort((a, b) => a.date.localeCompare(b.date)),
+    staff: G.users
+      .filter((u) => u.role === "treasurer")
+      .map((u) => {
+        const mapped = rows.filter(({ event }) => (u.eventIds || []).includes(event.id));
+        return {
+          user: u,
+          recorded: mapped.reduce(
+            (n, { data }) => n + data.tx.filter((x) => x.by === u.name).length,
+            0,
+          ),
+          verified: mapped.reduce(
+            (n, { data }) => n + data.tx.filter((x) => x.vBy === u.name).length,
+            0,
+          ),
+          events: mapped.map(({ event }) => event.name),
+        };
+      }),
+  };
+  render();
+}
+function vHubMonitor() {
+  const m = monitorCache;
+  if (!m) return `<div class="empty">${t("noneYet")}</div>`;
+  const k = (l, v, c) =>
+    `<div class="card kpi act" style="padding:11px 13px;justify-content:center"><div class="label">${l}</div><div class="n mono ${c || ""}">${v}</div></div>`;
+  return `<div class="rowsp" style="margin-bottom:10px">
+    <h2 style="font-size:17px">${t("financialSummary")}</h2>
+    <button class="btn ghost sm" onclick="loadMonitor()">${t("refresh")}</button></div>
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:16px">
+    ${
+      m.perEvent
+        .map(
+          ({ event, sums: s }) => `<div class="card" style="padding:13px">
+      <div class="rowsp" style="margin-bottom:6px"><span style="font-weight:700">${esc(event.name)}</span>
+        <span class="tag ${event.status === "active" ? "t-ok" : "t-exp"}">${event.status === "active" ? t("active") : t("archived")}</span></div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:6px">
+        ${k(t("net"), rpk(s.net), s.net >= 0 ? "pos" : "neg")}
+        ${k(t("wait"), rpk(s.pendAmt), "amb")}
+      </div></div>`,
+        )
+        .join("") || `<div class="empty">${t("noneYet")}</div>`
+    }
+  </div>
+  <div class="card" style="margin-bottom:16px"><h2 style="font-size:17px;margin-bottom:8px">${t("needsAttention")}</h2>
+    ${
+      m.pending.length
+        ? `<div class="scroll" style="max-height:320px">${m.pending
+            .map(
+              (x) => `<div class="rowsp" style="padding:7px 0;border-top:1px solid var(--line2)">
+        <div style="min-width:0"><div style="font-weight:600">${esc(x.name)}</div>
+        <div class="hint">${esc(x.eventName)} · ${rpk(x.amount)}</div></div>
+        <button class="btn ghost sm" onclick="switchEvent('${x.eventId}')">${t("enterWorkspace")}</button></div>`,
+            )
+            .join("")}</div>`
+        : `<div class="empty">${t("noQueue")}</div>`
+    }</div>
+  <div class="card"><h2 style="font-size:17px;margin-bottom:8px">${t("staffPerformance")}</h2>
+    <div style="overflow-x:auto"><table><thead><tr><th>${t("name")}</th><th>${t("events")}</th><th>${t("recorded")}</th><th>${t("verified")}</th></tr></thead><tbody>
+    ${
+      m.staff
+        .map(
+          (s) => `<tr><td style="font-weight:600">${esc(s.user.name)}</td>
+      <td class="hint">${s.events.map(esc).join(", ") || "-"}</td>
+      <td class="mono">${s.recorded}</td>
+      <td class="mono">${s.verified}</td></tr>`,
+        )
+        .join("") || `<tr><td colspan="4" class="empty">${t("noneYet")}</td></tr>`
+    }
+    </tbody></table></div></div>`;
 }
 
 /* ================= kerangka aplikasi ================= */
@@ -1036,6 +1623,7 @@ function setPanel(p) {
 }
 function setFilter(k) {
   filter = k;
+  txPage = 1;
   render();
 }
 function setAdminTab(k) {
@@ -1044,11 +1632,62 @@ function setAdminTab(k) {
 }
 function onLogSearch(v) {
   logQ = v;
+  logPage = 1;
   clearTimeout(window._lq);
   window._lq = setTimeout(render, 250);
 }
+function setLogPage(p) {
+  logPage = p;
+  render();
+}
+function setTxPage(p) {
+  txPage = p;
+  render();
+}
+function setBoardBuyPage(p) {
+  boardBuyPage = p;
+  render();
+}
+function setBoardDonPage(p) {
+  boardDonPage = p;
+  render();
+}
+function setHubEventsPage(p) {
+  hubEventsPage = p;
+  render();
+}
+function setHubEventsFilter(k) {
+  hubEventsFilter = k;
+  hubEventsPage = 1;
+  render();
+}
+function onHubEventsSearch(v) {
+  hubEventsQ = v;
+  hubEventsPage = 1;
+  clearTimeout(window._heq);
+  window._heq = setTimeout(render, 250);
+}
+function setHubStaffPage(p) {
+  hubStaffPage = p;
+  render();
+}
+function onHubStaffSearch(v) {
+  hubStaffQ = v;
+  hubStaffPage = 1;
+  clearTimeout(window._hsq);
+  window._hsq = setTimeout(render, 250);
+}
+function setHubStaffSort(k) {
+  hubStaffSort =
+    hubStaffSort.k === k
+      ? { k, dir: hubStaffSort.dir === "asc" ? "desc" : "asc" }
+      : { k, dir: "asc" };
+  hubStaffPage = 1;
+  render();
+}
 function openMe() {
   const a = acting();
+  const events = myEvents(a).filter((e) => e.id !== currentEventId);
   sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${esc(a.name)}</h2>
     ${closeBtn()}</div>
     <div class="hint" style="margin-bottom:6px">${esc(a.email)}</div>
@@ -1057,6 +1696,22 @@ function openMe() {
       imp
         ? `<p class="hint" style="margin-top:12px">${t("byAdmin", { n: esc(me.name) })}</p>
       <button class="btn wide" style="margin-top:8px" onclick="stopImp()">${t("backAdmin")}</button>`
+        : ""
+    }
+    ${
+      events.length
+        ? `<div class="field" style="margin-top:14px"><label>${t("switchEvent")}</label>
+      ${events
+        .map(
+          (e) =>
+            `<button class="btn ghost wide" style="display:flex;justify-content:flex-start;text-align:left;margin-bottom:6px" onclick="switchEvent('${e.id}')">${esc(e.name)}</button>`,
+        )
+        .join("")}</div>`
+        : ""
+    }
+    ${
+      isAdmin() && screen === "app"
+        ? `<button class="btn ghost wide" style="margin-top:6px" onclick="goHub()">${t("adminConsole")}</button>`
         : ""
     }
     <button class="btn danger wide" style="margin-top:14px" onclick="closeSheet();doSignOut()">${t("signOut")}</button>`);
@@ -1212,7 +1867,7 @@ function drawChart() {
 function txMatches(x, q) {
   return (
     !q ||
-    [x.name, x.phone, x.note, x.bank, x.cat, x.destAcc, x.by]
+    [x.name, x.phone, x.note, x.bank, x.cat, x.chequeNo, x.chequeBank, x.by]
       .join(" ")
       .toLowerCase()
       .includes(q)
@@ -1239,16 +1894,18 @@ function setTxSort(k) {
     txSort.k === k
       ? { k, dir: txSort.dir === "asc" ? "desc" : "asc" }
       : { k, dir: "asc" };
+  txPage = 1;
   render();
 }
 function onTxSearch(v) {
   txQ = v;
+  txPage = 1;
   clearTimeout(window._tq);
   window._tq = setTimeout(render, 250);
 }
 function vTx() {
   const q = txQ.toLowerCase();
-  const f = sortTx(
+  const all = sortTx(
     S.tx.filter(
       (x) =>
         (filter === "all" ||
@@ -1258,6 +1915,7 @@ function vTx() {
         txMatches(x, q),
     ),
   );
+  const { items: f, page, totalPages } = paginate(all, txPage);
   const si = (k) =>
     txSort.k === k ? (txSort.dir === "asc" ? " ▲" : " ▼") : "";
   return `<div style="padding:12px 0 110px">
@@ -1279,7 +1937,7 @@ function vTx() {
       <button class="btn ghost sm" onclick="openImport()">${t("imp")}</button></div></div>
   <div class="card" style="padding:2px 10px">${
     f.length
-      ? `<div class="scroll" style="max-height:calc(100dvh - 210px)"><table><thead><tr>
+      ? `<div style="overflow-x:auto"><table><thead><tr>
     <th class="sortable" onclick="setTxSort('date')">${t("date")}${si("date")}</th>
     <th class="sortable" onclick="setTxSort('name')">${t("name")}${si("name")}</th>
     <th>${t("detail")}</th>
@@ -1295,14 +1953,14 @@ function vTx() {
           ? `<span class="tag t-exp">${t("expW")}</span> ${esc(x.cat || "")}`
           : `<span class="tag ${x.type === "donation" ? "t-ok" : "t-tic"}">${x.type === "donation" ? t("donW") : t("seatsW")}</span> ${esc(x.cat || "")} · ${x.seats || 0}`
       }
-        <div class="hint">${esc(x.bank || "-")}${x.type === "expense" && x.destAcc ? " → " + esc(x.destAcc) : ""}${x.note ? " · " + esc(x.note) : ""}</div></td>
+        <div class="hint">${esc(x.bank || "-")}${x.chequeNo ? " · " + t("chequeNo") + " " + esc(x.chequeNo) : ""}${x.note ? " · " + esc(x.note) : ""}</div></td>
       <td class="mono ${x.type === "expense" ? "neg" : ""}" style="text-align:right;white-space:nowrap;font-weight:600">${x.type === "expense" ? "−" : ""}${rp(x.amount)}
         <div style="margin-top:3px">${x.status === "verified" ? `<span class="tag t-ok">${t("inRek")}</span>` : `<span class="tag t-wait">${t("stW")}</span>`}</div></td>
       <td style="text-align:right;white-space:nowrap">${x.proof ? `<button class="btn ghost sm icon" onclick="viewProofById('${x.id}')" title="${t("viewProof")}">${proofIcon}</button> ` : ""}${x.status === "pending" ? `<button class="btn ok sm" onclick="verify('${x.id}')">${t("inRek")}</button> ` : ""}
         <button class="btn ghost sm" onclick="openTx('${x.id}')">${t("edit")}</button></td></tr>`,
       )
       .join("")}
-    </tbody></table></div>`
+    </tbody></table></div>${pagerHtml(page, totalPages, "setTxPage")}`
       : `<div class="empty"><b>${t("noTx")}</b><br>${t("noTxSub")}</div>`
   }</div></div>`;
 }
@@ -1335,10 +1993,9 @@ function openTx(id) {
         cat: D().cats[0]?.n || "",
         seats: 1,
         amount: D().cats[0]?.p || 0,
-        bank: D().banks[0] || "",
+        bank: D().methods[0]?.name || "",
         note: "",
         proof: "",
-        destAcc: "",
         status: "pending",
       };
   sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${id ? t("editTx") : t("newTx")}</h2>
@@ -1357,12 +2014,13 @@ function openTx(id) {
     <input type="hidden" id="f_id" value="${x.id}"><input type="hidden" id="f_type" value="${x.type}">
     <div class="grid" style="grid-template-columns:1fr 1fr">
       <div class="field"><label>${t("date")}</label><input type="date" id="f_date" value="${x.date}"></div>
-      <div class="field"><label id="l_bank">${t("bankTo")}</label><select id="f_bank">${D()
-        .banks.map(
-          (b) => `<option ${b === x.bank ? "selected" : ""}>${esc(b)}</option>`,
+      <div class="field"><label id="l_bank">${t("bankTo")}</label><select id="f_bank" onchange="onMethodChange()">${D()
+        .methods.map(
+          (m) =>
+            `<option value="${esc(m.name)}" data-type="${m.type}" ${m.name === x.bank ? "selected" : ""}>${esc(m.name)}</option>`,
         )
         .join("")}</select></div>
-      <div class="field"><label id="l_name">${t("nameBuy")}</label><input id="f_name" value="${esc(x.name)}"></div>
+      <div class="field" id="w_name"><label id="l_name">${t("nameBuy")}</label><input id="f_name" value="${esc(x.name)}"></div>
       <div class="field" id="w_phone"><label>${t("wa")}</label><input id="f_phone" inputmode="tel" value="${esc(x.phone)}" placeholder="0812..."></div>
       <div class="field" id="w_cat"><label id="l_cat">${t("catSeat")}</label><select id="f_cat" onchange="recalc()">${D()
         .cats.map(
@@ -1377,9 +2035,20 @@ function openTx(id) {
           <button type="button" class="step-btn" onclick="stepSeats(1)" aria-label="+">+</button>
         </div></div>
     </div>
-    <div class="grid" id="w_expcat" style="display:none;grid-template-columns:1fr 1fr">
-      <div class="field"><label>${t("purpose")}</label><input id="f_expcat" value="${x.type === "expense" ? esc(x.cat) : ""}"></div>
-      <div class="field"><label>${t("destAcc")}</label><input id="f_destacc" value="${x.type === "expense" ? esc(x.destAcc || "") : ""}" placeholder="1234567890 a.n. ..."></div>
+    <div class="field" id="w_expcat" style="display:none">
+      <label>${t("purpose")}</label><input id="f_expcat" value="${x.type === "expense" ? esc(x.cat) : ""}">
+    </div>
+    <div class="field" id="w_cash" style="display:none">
+      <label>${t("cashBreakdown")}</label>
+      <div class="grid" style="grid-template-columns:repeat(3,1fr)">${CASH_DENOMS.map(
+        (d) =>
+          `<div class="field"><label>${rp(d)}</label><input type="number" min="0" inputmode="numeric" class="cash-denom" data-denom="${d}" value="${(x.cashBreakdown && x.cashBreakdown[d]) || 0}" oninput="recalcCash()"></div>`,
+      ).join("")}</div>
+    </div>
+    <div class="grid" id="w_cheque" style="display:none;grid-template-columns:1fr 1fr 1fr">
+      <div class="field"><label>${t("chequeNo")}</label><input id="f_chequeNo" value="${esc(x.chequeNo || "")}"></div>
+      <div class="field"><label>${t("chequeBank")}</label><input id="f_chequeBank" value="${esc(x.chequeBank || "")}"></div>
+      <div class="field"><label>${t("chequeDate")}</label><input type="date" id="f_chequeDate" value="${x.chequeDate || ""}"></div>
     </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
       <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev()">
@@ -1499,7 +2168,10 @@ function setType(k, init) {
     (i) => (document.getElementById(i).style.display = e ? "none" : "block"),
   );
   document.getElementById("w_phone").style.display = e ? "none" : "block";
-  document.getElementById("w_expcat").style.display = e ? "grid" : "none";
+  // pengeluaran menyembunyikan phone/cat/seats, jadi field nama jadi sendirian
+  // di barisnya - bentangkan penuh 2 kolom biar tidak kelihatan terpotong separuh
+  document.getElementById("w_name").style.gridColumn = e ? "1 / -1" : "";
+  document.getElementById("w_expcat").style.display = e ? "block" : "none";
   document.getElementById("l_name").textContent = e
     ? t("namePay")
     : k === "donation"
@@ -1514,6 +2186,7 @@ function setType(k, init) {
   document.getElementById("l_cat").textContent =
     k === "donation" ? t("catFree") : t("catSeat");
   if (!init && k === "ticket") recalc();
+  onMethodChange();
 }
 function stepSeats(d) {
   const el = document.getElementById("f_seats");
@@ -1531,10 +2204,31 @@ function recalc() {
     prev();
   }
 }
+function currentMethodType() {
+  const sel = document.getElementById("f_bank");
+  return sel?.selectedOptions[0]?.dataset.type || "bank";
+}
+function onMethodChange() {
+  const type = currentMethodType();
+  document.getElementById("w_cash").style.display = type === "cash" ? "block" : "none";
+  document.getElementById("w_cheque").style.display = type === "cheque" ? "grid" : "none";
+  const amt = document.getElementById("f_amount");
+  amt.readOnly = type === "cash";
+  if (type === "cash") recalcCash();
+}
+function recalcCash() {
+  let total = 0;
+  document
+    .querySelectorAll(".cash-denom")
+    .forEach((inp) => (total += (+inp.dataset.denom || 0) * (+inp.value || 0)));
+  document.getElementById("f_amount").value = total;
+  prev();
+}
 async function saveTx() {
   const g = (i) => document.getElementById("f_" + i).value,
     ty = g("type"),
-    id = g("id");
+    id = g("id"),
+    methodType = currentMethodType();
   const x = {
     id: id || uid(),
     type: ty,
@@ -1546,7 +2240,18 @@ async function saveTx() {
     seats: ty === "expense" ? 0 : +g("seats") || 0,
     amount: +g("amount") || 0,
     bank: g("bank"),
-    destAcc: ty === "expense" ? g("destacc") : "",
+    methodType,
+    cashBreakdown:
+      methodType === "cash"
+        ? Object.fromEntries(
+            Array.from(document.querySelectorAll(".cash-denom"))
+              .filter((i) => +i.value > 0)
+              .map((i) => [i.dataset.denom, +i.value]),
+          )
+        : {},
+    chequeNo: methodType === "cheque" ? g("chequeNo") : "",
+    chequeBank: methodType === "cheque" ? g("chequeBank") : "",
+    chequeDate: methodType === "cheque" ? g("chequeDate") : "",
     note: g("note"),
     proof: g("proof"),
     status: g("status"),
@@ -1590,21 +2295,32 @@ async function delTx(id) {
 
 /* ================= peringkat ================= */
 function vBoard() {
-  const a = byPerson("ticket").slice(0, 15),
-    b = byPerson("donation").slice(0, 15);
+  const BOARD_SIZE = 10;
+  const {
+    items: a,
+    page: pageBuy,
+    totalPages: totalBuy,
+  } = paginate(byPerson("ticket"), boardBuyPage, BOARD_SIZE);
+  const {
+    items: b,
+    page: pageDon,
+    totalPages: totalDon,
+  } = paginate(byPerson("donation"), boardDonPage, BOARD_SIZE);
   const row = (
     x,
-    i,
+    rank,
     u,
-  ) => `<div class="lb" style="animation-delay:${i * 35}ms"><div class="rank ${i === 0 ? "g1" : ""}">${i + 1}</div>
+  ) => `<div class="lb" style="animation-delay:${((rank - 1) % BOARD_SIZE) * 35}ms"><div class="rank ${rank === 1 ? "g1" : ""}">${rank}</div>
     <div style="flex:1;min-width:0"><div style="font-weight:600">${esc(x.name)}</div>
     <div class="hint">${x.n} ${t("trans")} · ${x.seats} ${t("seatsW").toLowerCase()}${u}</div></div>
     <div class="mono" style="font-weight:700">${rp(x.amount)}</div></div>`;
   return `<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(330px,1fr));padding:12px 0 110px">
     <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("topBuy")}</h2>
-      ${a.map((x, i) => row(x, i, "")).join("") || `<div class="empty">${t("noneYet")}</div>`}</div>
+      ${a.map((x, i) => row(x, (pageBuy - 1) * BOARD_SIZE + i + 1, "")).join("") || `<div class="empty">${t("noneYet")}</div>`}
+      ${pagerHtml(pageBuy, totalBuy, "setBoardBuyPage")}</div>
     <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("topDon")}</h2>
-      ${b.map((x, i) => row(x, i, " " + t("free"))).join("") || `<div class="empty">${t("noneYet")}</div>`}</div></div>`;
+      ${b.map((x, i) => row(x, (pageDon - 1) * BOARD_SIZE + i + 1, " " + t("free"))).join("") || `<div class="empty">${t("noneYet")}</div>`}
+      ${pagerHtml(pageDon, totalDon, "setBoardDonPage")}</div></div>`;
 }
 
 /* ================= admin ================= */
@@ -1612,7 +2328,6 @@ function vAdmin() {
   if (!isAdmin()) return `<div class="empty">${t("onlyAdmin")}</div>`;
   return `<div style="padding:12px 0 110px">
     <div class="seg" style="margin-bottom:12px">${[
-      ["users", t("users")],
       ["logs", t("logs")],
       ["set", t("set")],
     ]
@@ -1621,16 +2336,50 @@ function vAdmin() {
           `<button class="${adminTab === k ? "on" : ""}" onclick="setAdminTab('${k}')">${l}</button>`,
       )
       .join("")}</div>
-    ${{ users: vUsers, logs: vLogs, set: vSet }[adminTab]()}</div>`;
+    ${{ logs: vLogs, set: vSet }[adminTab]()}</div>`;
 }
-function vUsers() {
-  return `<div class="card"><div class="rowsp" style="margin-bottom:8px">
-    <h2 style="font-size:17px">${t("users")}</h2><button class="btn sm" onclick="openUser()">${t("addUser")}</button></div>
-  <div style="overflow-x:auto"><table><thead><tr><th>${t("name")}</th><th>${t("role")}</th><th>${t("status")}</th>
-    <th>${t("lastIn")}</th><th></th></tr></thead><tbody>
-    ${S.users
-      .map(
-        (u) => `<tr>
+function vHubStaff() {
+  const q = hubStaffQ.toLowerCase();
+  let all = G.users.filter(
+    (u) =>
+      (hubStaffFilter === "all" || u.role === hubStaffFilter) &&
+      (!q || (u.name + " " + u.email).toLowerCase().includes(q)),
+  );
+  const { k, dir } = hubStaffSort,
+    mul = dir === "asc" ? 1 : -1;
+  all = all.slice().sort((a, b) => {
+    const av = String(a[k] ?? "").toLowerCase(),
+      bv = String(b[k] ?? "").toLowerCase();
+    return av > bv ? mul : av < bv ? -mul : 0;
+  });
+  const { items, page, totalPages } = paginate(all, hubStaffPage, 10);
+  const si = (k) =>
+    hubStaffSort.k === k ? (hubStaffSort.dir === "asc" ? " ▲" : " ▼") : "";
+  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="font-size:17px">${t("staff")}</h2>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
+      <div class="chips">${[
+        ["all", t("all")],
+        ["admin", t("admins")],
+        ["treasurer", t("treas")],
+      ]
+        .map(
+          ([k2, l]) =>
+            `<button class="chip ${hubStaffFilter === k2 ? "on" : ""}" onclick="setHubStaffFilter('${k2}')">${l}</button>`,
+        )
+        .join("")}</div>
+      <input style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(hubStaffQ)}" oninput="onHubStaffSearch(this.value)">
+      <button class="btn sm" onclick="openUser()">${t("addUser")}</button></div></div>
+  <div style="overflow-x:auto"><table><thead><tr>
+    <th class="sortable" onclick="setHubStaffSort('name')">${t("name")}${si("name")}</th>
+    <th class="sortable" onclick="setHubStaffSort('role')">${t("role")}${si("role")}</th>
+    <th class="sortable" onclick="setHubStaffSort('active')">${t("status")}${si("active")}</th>
+    <th class="sortable" onclick="setHubStaffSort('last')">${t("lastIn")}${si("last")}</th><th></th></tr></thead><tbody>
+    ${
+      items.length
+        ? items
+            .map(
+              (u) => `<tr>
       <td><div style="font-weight:600">${esc(u.name)}</div><div class="hint">${esc(u.email)}${u.provider === "google" ? " · Google" : ""}</div></td>
       <td><span class="tag ${u.role === "admin" ? "t-adm" : "t-tic"}">${u.role === "admin" ? t("admins") : t("treas")}</span></td>
       <td><span class="tag ${u.active ? "t-ok" : "t-exp"}">${u.active ? t("active") : t("inactive")}</span></td>
@@ -1638,36 +2387,61 @@ function vUsers() {
       <td style="text-align:right;white-space:nowrap">
         ${u.email !== me.email && u.active ? `<button class="btn ghost sm" onclick="startImp('${esc(u.email)}')">${t("loginAs")}</button> ` : ""}
         <button class="btn ghost sm" onclick="openUser('${esc(u.email)}')">${t("edit")}</button></td></tr>`,
-      )
-      .join("")}
-  </tbody></table></div></div>`;
+            )
+            .join("")
+        : `<tr><td colspan="5" class="empty">${t("noneYet")}</td></tr>`
+    }
+  </tbody></table></div>${pagerHtml(page, totalPages, "setHubStaffPage")}</div>`;
+}
+function setHubStaffFilter(k) {
+  hubStaffFilter = k;
+  hubStaffPage = 1;
+  render();
+}
+function toggleEventChip(el) {
+  el.classList.toggle("on");
 }
 function openUser(email) {
   const u = email
-    ? S.users.find((x) => x.email === email)
+    ? G.users.find((x) => x.email === email)
     : {
         name: "",
         email: "",
         role: "treasurer",
         active: true,
         provider: "password",
+        eventIds: [],
       };
+  const activeEvents = G.events.filter((e) => e.status === "active");
   sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${email ? t("edit") : t("addUser")}</h2>
     ${closeBtn()}</div>
     <input type="hidden" id="v_old" value="${esc(email || "")}">
     <div class="field"><label>${t("fullName")}</label><input id="v_name" value="${esc(u.name)}"></div>
     <div class="field"><label>${t("email")}</label><input id="v_email" type="email" value="${esc(u.email)}" ${email ? "disabled" : ""}></div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="field"><label>${t("role")}</label><select id="v_role">
+      <div class="field"><label>${t("role")}</label><select id="v_role" onchange="document.getElementById('v_events_wrap').style.display=this.value==='admin'?'none':'block'">
         <option value="treasurer" ${u.role === "treasurer" ? "selected" : ""}>${t("treas")}</option>
         <option value="admin" ${u.role === "admin" ? "selected" : ""}>${t("admins")}</option></select></div>
       <div class="field"><label>${t("status")}</label><select id="v_active">
         <option value="1" ${u.active ? "selected" : ""}>${t("active")}</option>
         <option value="0" ${!u.active ? "selected" : ""}>${t("inactive")}</option></select></div></div>
     <div class="field"><label>${email ? t("newPass") : t("pass")}</label><input id="v_pass" type="password" placeholder="${email ? "—" : ""}"></div>
+    <div class="field" id="v_events_wrap" style="${u.role === "admin" ? "display:none" : ""}">
+      <label>${t("events")}</label>
+      <div class="chips" id="v_events">${
+        activeEvents.length
+          ? activeEvents
+              .map(
+                (e) =>
+                  `<span class="chip ${(u.eventIds || []).includes(e.id) ? "on" : ""}" data-id="${e.id}" onclick="toggleEventChip(this)">${esc(e.name)}</span>`,
+              )
+              .join("")
+          : `<span class="hint">${t("noEventsAssigned")}</span>`
+      }</div>
+    </div>
     <div class="rowsp" style="margin-top:12px">
       ${email && email !== me.email ? `<button class="btn danger" onclick="delUser('${esc(email)}')">${t("del")}</button>` : "<span></span>"}
-      <button class="btn" onclick="saveUser()">${t("save")}</button></div>`);
+      <button class="btn" onclick="saveUser()">${t("saveGeneric")}</button></div>`);
 }
 async function saveUser() {
   const old = val("v_old"),
@@ -1678,25 +2452,32 @@ async function saveUser() {
     p = val("v_pass");
   if (!n || !e) return toast(t("fillAll"));
   if (p && p.length < 8) return toast(t("passShort"));
-  await pull();
-  if (!old && S.users.some((x) => x.email === e)) return toast(t("emailUsed"));
+  await pullHub();
+  if (!old && G.users.some((x) => x.email === e)) return toast(t("emailUsed"));
   if (!old && !p) return toast(t("fillAll"));
-  const admins = S.users.filter(
+  const admins = G.users.filter(
     (x) => x.role === "admin" && x.active && x.email !== old,
   ).length;
   if (old && !(role === "admin" && act) && admins === 0)
     return toast(t("lastAdmin"));
   const hash = p ? await sha(e + p) : null;
-  await mutate(
+  const eventIds =
+    role === "admin"
+      ? []
+      : Array.from(document.querySelectorAll("#v_events .chip.on")).map(
+          (c) => c.dataset.id,
+        );
+  await mutateHub(
     () => {
       if (old) {
-        const u = S.users.find((x) => x.email === old);
+        const u = G.users.find((x) => x.email === old);
         u.name = n;
         u.role = role;
         u.active = act;
+        u.eventIds = eventIds;
         if (hash) u.pass = hash;
       } else
-        S.users.push({
+        G.users.push({
           id: uid(),
           name: n,
           email: e,
@@ -1707,28 +2488,29 @@ async function saveUser() {
           rec: "",
           created: now(),
           last: "",
+          eventIds,
         });
     },
     "actUser",
     `${old ? t("userSaved") : t("userAdded")}: ${n} (${role === "admin" ? t("admins") : t("treas")})`,
   );
-  if (me.email === old) me = S.users.find((x) => x.email === old);
+  if (me.email === old) me = G.users.find((x) => x.email === old);
   closeSheet();
   toast(old ? t("userSaved") : t("userAdded"));
   render();
 }
 async function delUser(email) {
   if (!confirm(t("confirmUser"))) return;
-  await pull();
-  const u = S.users.find((x) => x.email === email);
+  await pullHub();
+  const u = G.users.find((x) => x.email === email);
   if (
-    S.users.filter((x) => x.role === "admin" && x.active).length <= 1 &&
+    G.users.filter((x) => x.role === "admin" && x.active).length <= 1 &&
     u.role === "admin"
   )
     return toast(t("lastAdmin"));
-  await mutate(
+  await mutateHub(
     () => {
-      S.users = S.users.filter((x) => x.email !== email);
+      G.users = G.users.filter((x) => x.email !== email);
     },
     "actUser",
     t("userDel") + ": " + u.name,
@@ -1738,9 +2520,10 @@ async function delUser(email) {
   render();
 }
 async function startImp(email) {
-  imp = S.users.find((x) => x.email === email);
+  imp = G.users.find((x) => x.email === email);
+  await enterResolved(imp, null);
   tab = "dash";
-  await mutate(() => {}, "actImp", imp.name + " (" + imp.email + ")");
+  await mutateHub(() => {}, "actImp", imp.name + " (" + imp.email + ")");
   await saveSession();
   render();
   toast(t("impBanner", { n: imp.name }));
@@ -1749,11 +2532,12 @@ async function startImp(email) {
 /* ================= log aktivitas ================= */
 function vLogs() {
   const q = logQ.toLowerCase();
-  const rows = S.logs.filter(
+  const all = S.logs.filter(
     (l) =>
       !q ||
       [l.user, l.email, t(l.act), l.det].join(" ").toLowerCase().includes(q),
   );
+  const { items: rows, page, totalPages } = paginate(all, logPage);
   return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
     <h2 style="font-size:17px">${t("logs")}</h2>
     <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:220px">
@@ -1762,7 +2546,7 @@ function vLogs() {
       <button class="btn ghost sm" onclick="exportLogs()">${t("exportLog")}</button></div></div>
   ${
     rows.length
-      ? `<div class="scroll" style="max-height:calc(100dvh - 260px)"><table><thead><tr>
+      ? `<div style="overflow-x:auto"><table><thead><tr>
     <th>${t("time")}</th><th>${t("user")}</th><th>${t("action")}</th><th>${t("info")}</th></tr></thead><tbody>
     ${rows
       .map(
@@ -1772,7 +2556,7 @@ function vLogs() {
       <td><span class="tag ${/Delete|Hapus/.test(t(l.act)) ? "t-exp" : /Verif/.test(t(l.act)) ? "t-ok" : "t-tic"}">${t(l.act)}</span></td>
       <td class="hint">${esc(l.det)}</td></tr>`,
       )
-      .join("")}</tbody></table></div>`
+      .join("")}</tbody></table></div>${pagerHtml(page, totalPages, "setLogPage")}`
       : `<div class="empty">${t("noLog")}</div>`
   }</div>`;
 }
@@ -1797,7 +2581,6 @@ function vSet() {
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
       <div class="field"><label>${t("evName")}</label><input id="s_ev" value="${esc(D().event)}"></div>
       <div class="field"><label>${t("evDate")}</label><input type="date" id="s_date" value="${D().date || ""}"></div></div>
-    <div class="field"><label>${t("bankList")}</label><input id="s_banks" value="${esc(D().banks.join(", "))}"></div>
     <div><button class="btn" onclick="saveSet()">${t("saveSet")}</button></div></div>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(330px,1fr))">
     <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("catTitle")}</h2>
@@ -1815,6 +2598,22 @@ function vSet() {
         .join("")}
       </tbody></table></div>
       <div><button class="btn ghost sm" style="margin-top:10px" onclick="addCat()">${t("addCat")}</button></div></div>
+    <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("methods")}</h2>
+      <div style="overflow-x:auto"><table><thead><tr><th>${t("methodName")}</th><th>${t("methodType")}</th><th></th></tr></thead><tbody>
+      ${D()
+        .methods.map(
+          (m, i) => `<tr><td><input value="${esc(m.name)}" onchange="editMethod(${i},'name',this.value)"></td>
+        <td><select onchange="editMethod(${i},'type',this.value)">
+          <option value="bank" ${m.type === "bank" ? "selected" : ""}>${t("methodBank")}</option>
+          <option value="cash" ${m.type === "cash" ? "selected" : ""}>${t("methodCash")}</option>
+          <option value="cheque" ${m.type === "cheque" ? "selected" : ""}>${t("methodCheque")}</option>
+          <option value="other" ${m.type === "other" ? "selected" : ""}>${t("methodOther")}</option>
+        </select></td>
+        <td><button class="btn danger sm" onclick="delMethod(${i})">${t("del")}</button></td></tr>`,
+        )
+        .join("")}
+      </tbody></table></div>
+      <div><button class="btn ghost sm" style="margin-top:10px" onclick="addMethod()">${t("addMethod")}</button></div></div>
     <div class="card"><h2 style="font-size:17px">${t("tplTitle")}</h2>
       <p class="hint" style="margin:4px 0 8px">${t("tplP")}</p>
       <div style="overflow-x:auto"><table><thead><tr><th>${t("field")}</th><th>${t("colName")}</th><th></th></tr></thead><tbody>
@@ -1842,21 +2641,41 @@ function vSet() {
 }
 async function saveSet() {
   const ev = val("s_ev"),
-    dt = val("s_date"),
-    bk = val("s_banks")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    dt = val("s_date");
   await mutate(
     () => {
       S.config.event = ev;
       S.config.date = dt;
-      S.config.banks = bk;
     },
     "actSet",
-    ev + " · " + bk.join(", "),
+    ev,
   );
+  await mutateHub(() => {
+    const e = G.events.find((x) => x.id === currentEventId);
+    if (e) {
+      e.name = ev;
+      e.date = dt;
+    }
+  }, null);
   toast(t("setSaved"));
+  render();
+}
+async function addMethod() {
+  await mutate(() => {
+    S.config.methods.push({ id: uid(), name: "—", type: "bank" });
+  }, "actSet", t("addMethod"));
+  render();
+}
+async function editMethod(i, k, v) {
+  await mutate(() => {
+    S.config.methods[i][k] = v;
+  }, "actSet", t("methods") + ": " + S.config.methods[i].name);
+}
+async function delMethod(i) {
+  const n = S.config.methods[i].name;
+  await mutate(() => {
+    S.config.methods.splice(i, 1);
+  }, "actSet", t("del") + ": " + n);
   render();
 }
 async function editCat(i, k, v) {
@@ -1879,9 +2698,16 @@ async function editTpl(i, v) {
 }
 async function addCustomCol() {
   const f = "c_" + uid();
+  // nama default harus unik dari kolom lain - Excel Table tidak mengizinkan
+  // dua kolom dengan nama sama (tabel akan dianggap rusak dan "diperbaiki"
+  // Excel dengan cara membuang fitur Table/AutoFilter-nya)
+  const base = t("customCol");
+  let h = base,
+    n = 1;
+  while (S.config.tpl.some((c) => c.h === h)) h = `${base} ${++n}`;
   await mutate(
     () => {
-      S.config.tpl.push({ f, h: t("customCol"), custom: true });
+      S.config.tpl.push({ f, h, custom: true });
     },
     "actSet",
     t("addCol"),
@@ -1991,16 +2817,41 @@ function addReportTitle(ws, subtitle) {
   c2.alignment = { horizontal: "center" };
   ws.getRow(1).height = 22;
 }
+// Excel Table mensyaratkan nama kolom unik - kalau ada dua kolom bernama sama
+// (mis. beberapa "Kustom" yang belum diganti nama) file akan dianggap rusak
+// oleh Excel dan Table/AutoFilter-nya dibuang otomatis. Ini jaring pengaman
+// terakhir supaya export tidak pernah menghasilkan file yang rusak, apa pun
+// penyebab duplikatnya.
+function uniqueHeaders(cols) {
+  const seen = {};
+  return cols.map((c) => {
+    const base = c.h || c.f;
+    seen[base] = (seen[base] || 0) + 1;
+    return seen[base] === 1 ? base : `${base} (${seen[base]})`;
+  });
+}
 function addTxTable(ws, txList, tableName) {
   const cols = D().tpl;
-  ws.addTable({
-    name: tableName + Math.floor(Math.random() * 1e6),
-    ref: "A4",
-    headerRow: true,
-    style: { theme: "TableStyleMedium2", showRowStripes: true },
-    columns: cols.map((c) => ({ name: c.h, filterButton: true })),
-    rows: txList.map((x, i) => cols.map((c) => cellValue(x, c, i + 1))),
-  });
+  const headers = uniqueHeaders(cols);
+  // Excel Table tidak boleh punya 0 baris data (UI-nya sendiri tidak
+  // mengizinkan itu) - kalau periode yang dipilih kebetulan tidak ada
+  // transaksinya, ws.addTable() menghasilkan definisi tabel yang tidak valid
+  // dan seluruh file dianggap rusak oleh Excel. Kalau kosong, tulis header
+  // biasa saja (tanpa fitur Table/AutoFilter) supaya filenya tetap valid.
+  if (txList.length) {
+    ws.addTable({
+      name: tableName + Math.floor(Math.random() * 1e6),
+      ref: "A4",
+      headerRow: true,
+      style: { theme: "TableStyleMedium2", showRowStripes: true },
+      columns: cols.map((c, i) => ({ name: headers[i], filterButton: true })),
+      rows: txList.map((x, i) => cols.map((c) => cellValue(x, c, i + 1))),
+    });
+  } else {
+    const row = ws.getRow(4);
+    headers.forEach((h, i) => (row.getCell(i + 1).value = h));
+    styleHeaderRow(ws, 4);
+  }
   cols.forEach((c, i) => {
     const col = ws.getColumn(i + 1);
     col.width = Math.max(c.h.length + 4, c.f === "note" ? 24 : c.f === "name" ? 20 : 13);
@@ -2041,7 +2892,7 @@ async function dlTemplate() {
       cat: D().cats[0]?.n || "Reguler",
       seats: 2,
       amount: (D().cats[0]?.p || 0) * 2,
-      bank: D().banks[0] || "BCA",
+      bank: D().methods[0]?.name || "BCA",
       status: "verified",
       note: "Transfer 08.41",
       date: today(),
@@ -2054,7 +2905,7 @@ async function dlTemplate() {
       cat: D().cats[0]?.n || "Reguler",
       seats: 10,
       amount: 25000000,
-      bank: D().banks[0] || "BCA",
+      bank: D().methods[0]?.name || "BCA",
       status: "pending",
       note: "",
       date: today(),
@@ -2067,7 +2918,7 @@ async function dlTemplate() {
       cat: "",
       seats: 0,
       amount: 7500000,
-      bank: D().banks[0] || "BCA",
+      bank: D().methods[0]?.name || "BCA",
       status: "verified",
       note: "DP 50%",
       date: today(),
@@ -2143,11 +2994,31 @@ function normType(v) {
 function normNum(v) {
   return +String(v ?? "").replace(/[^\d.-]/g, "") || 0;
 }
+// file yang di-download dari app sendiri (template maupun laporan) punya 3
+// baris judul (LAPORAN KEUANGAN / periode / kosong) sebelum baris header -
+// cari baris mana yang paling cocok dengan nama kolom di D().tpl, jangan
+// asumsikan header selalu di baris pertama (juga tetap benar untuk file
+// polos yang headernya memang di baris pertama)
+function findHeaderRowIndex(rows) {
+  const tplHeaders = D().tpl.map((c) => String(c.h).trim().toLowerCase());
+  let bestIdx = 0,
+    bestScore = -1;
+  for (let i = 0; i < Math.min(rows.length, 10); i++) {
+    const row = (rows[i] || []).map((h) => String(h).trim().toLowerCase());
+    const score = row.filter((h) => tplHeaders.includes(h)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
 function parseRows(rows) {
   const body = document.getElementById("impBody");
   if (!rows || rows.length < 2)
     return (body.innerHTML = `<div class="empty">${t("noCol")}</div>`);
-  const head = rows[0].map((h) => String(h).trim().toLowerCase()),
+  const headerIdx = findHeaderRowIndex(rows);
+  const head = (rows[headerIdx] || []).map((h) => String(h).trim().toLowerCase()),
     idx = {};
   D().tpl.forEach((c) => {
     const i = head.indexOf(String(c.h).trim().toLowerCase());
@@ -2164,7 +3035,7 @@ function parseRows(rows) {
   const customCols = D().tpl.filter((c) => c.custom);
   pendingImp = [];
   let bad = 0;
-  rows.slice(1).forEach((r) => {
+  rows.slice(headerIdx + 1).forEach((r) => {
     if (!r || !r.length || r.every((c) => String(c).trim() === "")) return;
     const debit = normNum(get(r, "debit")),
       credit = normNum(get(r, "credit")),
@@ -2197,8 +3068,14 @@ function parseRows(rows) {
       ),
       seats: ty === "expense" ? 0 : normNum(get(r, "seats")),
       amount: amt,
-      bank: String(get(r, "bank") || D().banks[0] || ""),
-      destAcc: ty === "expense" ? String(get(r, "destAcc") || "") : "",
+      bank: String(get(r, "bank") || D().methods[0]?.name || ""),
+      methodType:
+        D().methods.find((m) => m.name === String(get(r, "bank") || ""))?.type ||
+        "bank",
+      cashBreakdown: {},
+      chequeNo: "",
+      chequeBank: "",
+      chequeDate: "",
       note: String(get(r, "note") || ""),
       proof: "",
       status: st,
@@ -2389,8 +3266,20 @@ Object.assign(window, {
   setFilter,
   setAdminTab,
   onLogSearch,
+  setLogPage,
   setTxSort,
   onTxSearch,
+  setTxPage,
+  setBoardBuyPage,
+  setBoardDonPage,
+  setHubEventsPage,
+  onHubEventsSearch,
+  setHubEventsSort,
+  setHubEventsFilter,
+  setHubStaffPage,
+  onHubStaffSearch,
+  setHubStaffSort,
+  setHubStaffFilter,
   openTx,
   saveTx,
   delTx,
@@ -2413,6 +3302,14 @@ Object.assign(window, {
   saveUser,
   delUser,
   startImp,
+  toggleEventChip,
+  switchEvent,
+  goHub,
+  setHubTab,
+  openNewEvent,
+  createEventSubmit,
+  toggleArchive,
+  loadMonitor,
   saveSet,
   editCat,
   editTpl,
@@ -2420,6 +3317,11 @@ Object.assign(window, {
   delTplCol,
   addCat,
   delCat,
+  addMethod,
+  editMethod,
+  delMethod,
+  onMethodChange,
+  recalcCash,
   resetAll,
   openExportPeriod,
   setExportKind,
