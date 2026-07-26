@@ -852,7 +852,12 @@ input[readonly]:hover {
   .xls-label {
     display: none;
   }
-  .xls-btn {
+  /* dua kelas (.btn.xls-btn), bukan cuma .xls-btn - .btn.sm juga dua kelas
+     (spesifisitas sama) dan urutannya di file ini LEBIH BELAKANGAN drpd
+     .xls-btn, jadi kalau cuma satu kelas, padding:8px 12px milik .btn.sm
+     tetap menang & bikin ikonnya sesak (persis pola yg bikin .btn.icon
+     harus dipasangkan sbg 2 kelas jg spy bisa menang lawan .btn.sm) */
+  .btn.xls-btn {
     padding: 0;
     width: 34px;
     height: 34px;

@@ -472,7 +472,8 @@ const L = {
     fileAttached: "Gambar terpasang",
     viewProof: "Lihat bukti",
     searchTx: "Cari nama, telepon, catatan, rekening...",
-    status: "Status pembayaran",
+    status: "Status",
+    payStatus: "Status pembayaran",
     stW: "Belum lunas",
     stV: "Lunas",
     save: "Simpan transaksi",
@@ -748,7 +749,8 @@ const L = {
     fileAttached: "Image attached",
     viewProof: "View proof",
     searchTx: "Search name, phone, note, account...",
-    status: "Payment status",
+    status: "Status",
+    payStatus: "Payment status",
     stW: "Unpaid",
     stV: "Paid",
     save: "Save transaction",
@@ -1628,6 +1630,29 @@ function hubEventsListHtml() {
     return av > bv ? mul : av < bv ? -mul : 0;
   });
   const { items, page, totalPages } = paginate(all, hubEventsPage, 10);
+  if (!items.length) return `<div class="empty">${t("noneYet")}</div>`;
+  if (narrow())
+    return (
+      items
+        .map(
+          (e) => `<div class="drill-row">
+      <div class="drill-row-bar" style="background:${e.status === "active" ? "var(--green)" : "var(--red)"}"></div>
+      <div style="flex:1;min-width:0">
+        <div class="rowsp" style="gap:8px;align-items:flex-start">
+          <div style="min-width:0">
+            <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</div>
+            <div class="hint mono" style="margin-top:2px">${e.date || "-"}</div>
+          </div>
+          <span class="tag ${e.status === "active" ? "t-ok" : "t-exp"}" style="flex:none">${e.status === "active" ? t("active") : t("archived")}</span>
+        </div>
+        <div class="rowsp" style="margin-top:8px;gap:8px">
+          ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button>` : "<span></span>"}
+          <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
+        </div>
+      </div></div>`,
+        )
+        .join("") + pagerHtml(page, totalPages, "setHubEventsPage")
+    );
   const si = (k) =>
     hubEventsSort.k === k ? (hubEventsSort.dir === "asc" ? " ▲" : " ▼") : "";
   return `<div style="overflow-x:auto"><table><thead><tr>
@@ -1635,11 +1660,9 @@ function hubEventsListHtml() {
       <th class="sortable" onclick="setHubEventsSort('date')">${t("evDate")}${si("date")}</th>
       <th class="sortable" onclick="setHubEventsSort('status')">${t("status")}${si("status")}</th>
       <th></th></tr></thead><tbody>
-    ${
-      items.length
-        ? items
-            .map(
-              (e) => `<tr>
+    ${items
+      .map(
+        (e) => `<tr>
       <td style="font-weight:600">${esc(e.name)}</td>
       <td class="hint mono">${e.date || "-"}</td>
       <td><span class="tag ${e.status === "active" ? "t-ok" : "t-exp"}">${e.status === "active" ? t("active") : t("archived")}</span></td>
@@ -1647,10 +1670,8 @@ function hubEventsListHtml() {
         ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button> ` : ""}
         <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
       </td></tr>`,
-            )
-            .join("")
-        : `<tr><td colspan="4" class="empty">${t("noneYet")}</td></tr>`
-    }
+      )
+      .join("")}
     </tbody></table></div>${pagerHtml(page, totalPages, "setHubEventsPage")}`;
 }
 function vHubEvents() {
@@ -1785,7 +1806,7 @@ function vHubMonitor() {
         : `<div class="empty">${t("noQueue")}</div>`
     }</div>
   <div class="card"><h2 style="font-size:17px;margin-bottom:8px">${t("staffPerformance")}</h2>
-    <div style="overflow-x:auto"><table><thead><tr><th>${t("name")}</th><th>${t("events")}</th><th>${t("recorded")}</th><th>${t("verified")}</th></tr></thead><tbody>
+    <div style="overflow-x:auto"><table style="min-width:520px"><thead><tr><th style="min-width:140px">${t("name")}</th><th style="min-width:180px">${t("events")}</th><th style="min-width:90px">${t("recorded")}</th><th style="min-width:90px">${t("verified")}</th></tr></thead><tbody>
     ${
       m.staff
         .map(
@@ -2863,6 +2884,35 @@ function onTxSearch(v) {
     if (el) el.innerHTML = txListCardHtml();
   }, 250);
 }
+// baris kartu ringkas (bukan <tr>) dipakai di layar sempit - tabel 5 kolom
+// dipaksa muat 100% lebar viewport bikin tiap sel membungkus jadi berbaris2
+// & kolom nominal/status kepotong (lihat txListCardHtml()). Gaya kartu ini
+// pakai ulang class .drill-row yg sama dgn pop-up drill-down, spy konsisten.
+function txRowCardHtml(x) {
+  const isExp = x.type === "expense";
+  const detail = [catLabel(x) + (x.seats ? " · " + x.seats : ""), x.bank || "-"]
+    .filter(Boolean)
+    .map(esc)
+    .join(" · ");
+  return `<div class="drill-row drill" onclick="openTx('${x.id}')">
+    <div class="drill-row-bar ${isExp ? "drill-bar-neg" : "drill-bar-pos"}"></div>
+    <div style="flex:1;min-width:0;display:flex;justify-content:space-between;gap:10px;align-items:flex-start">
+      <div style="min-width:0">
+        <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</div>
+        <div class="hint" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${detail}</div>
+        <div class="hint" style="margin-top:1px">${x.date.slice(8)}/${x.date.slice(5, 7)}/${x.date.slice(0, 4)}</div>
+      </div>
+      <div style="text-align:right;flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+        <div class="mono" style="font-weight:700${isExp ? ";color:var(--red)" : ""}">${isExp ? "−" : ""}${rp(x.amount)}</div>
+        ${
+          x.status === "pending"
+            ? `<button class="btn ok sm" style="padding:5px 10px;font-size:12px" onclick="event.stopPropagation();verify('${x.id}')">${t("inRek")}</button>`
+            : `<span class="tag t-ok">${t("inRek")}</span>`
+        }
+      </div>
+    </div>
+  </div>`;
+}
 function txListCardHtml() {
   const q = txQ.toLowerCase();
   const all = sortTx(
@@ -2876,10 +2926,11 @@ function txListCardHtml() {
     ),
   );
   const { items: f, page, totalPages } = paginate(all, txPage);
+  if (!f.length) return `<div class="empty"><b>${t("noTx")}</b><br>${t("noTxSub")}</div>`;
+  if (narrow()) return f.map(txRowCardHtml).join("") + pagerHtml(page, totalPages, "setTxPage");
   const si = (k) =>
     txSort.k === k ? (txSort.dir === "asc" ? " ▲" : " ▼") : "";
-  return f.length
-    ? `<div style="overflow-x:auto"><table><thead><tr>
+  return `<div style="overflow-x:auto"><table><thead><tr>
     <th class="sortable" onclick="setTxSort('date')">${t("date")}${si("date")}</th>
     <th class="sortable" onclick="setTxSort('name')">${t("name")}${si("name")}</th>
     <th>${t("detail")}</th>
@@ -2902,8 +2953,7 @@ function txListCardHtml() {
         <button class="btn ghost sm" onclick="openTx('${x.id}')">${t("edit")}</button></td></tr>`,
       )
       .join("")}
-    </tbody></table></div>${pagerHtml(page, totalPages, "setTxPage")}`
-    : `<div class="empty"><b>${t("noTx")}</b><br>${t("noTxSub")}</div>`;
+    </tbody></table></div>${pagerHtml(page, totalPages, "setTxPage")}`;
 }
 function vTx() {
   return `<div style="padding:12px 0 110px">
@@ -2993,7 +3043,7 @@ function openTx(id) {
       <div class="field" id="w_bankName" style="display:none">
         <label>${t("bankNameLbl")} <span class="req">*</span></label>
         <select id="f_bankName">${INDONESIA_BANKS.map((b) => `<option ${b === x.bankName ? "selected" : ""}>${esc(b)}</option>`).join("")}</select></div>
-      <div class="field" id="w_name"><label id="l_name">${t("nameGeneric")}</label> <span class="req">*</span><input id="f_name" value="${esc(x.name)}"></div>
+      <div class="field" id="w_name"><label id="l_name">${t("nameGeneric")} <span class="req">*</span></label><input id="f_name" value="${esc(x.name)}"></div>
       <div class="field" id="w_phone"><label>${t("wa")}</label><input id="f_phone" inputmode="tel" value="${esc(x.phone)}" placeholder="0812..."></div>
       <div class="field" id="w_seats"><label>${t("nSeat")}</label>
         <div class="stepper">
@@ -3008,9 +3058,9 @@ function openTx(id) {
       <div class="field"><label>${t("chequeDate")}</label><input type="date" id="f_chequeDate" value="${x.chequeDate || ""}"></div>
     </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label> <span class="req">*</span><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev();updateBonusHint()">
+      <div class="field amt-field"><label id="l_amount">${t("amtIn")} <span class="req">*</span></label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev();updateBonusHint()">
         <div class="hint mono" id="prev" style="margin-top:4px">${rp(x.amount)}</div></div>
-      <div class="field"><label>${t("status")}</label><select id="f_status">
+      <div class="field"><label>${t("payStatus")}</label><select id="f_status">
         <option value="pending" ${x.status === "pending" ? "selected" : ""}>${t("stW")}</option>
         <option value="verified" ${x.status === "verified" ? "selected" : ""}>${t("stV")}</option></select></div></div>
     <div id="w_bonusHint" style="display:none;margin-bottom:14px"></div>
@@ -3165,7 +3215,7 @@ function onCatChange(init, x) {
   // pengeluaran menyembunyikan phone, jadi field nama jadi sendirian di
   // barisnya - bentangkan penuh 2 kolom biar tidak kelihatan terpotong separuh
   document.getElementById("w_name").style.gridColumn = e ? "1 / -1" : "";
-  document.getElementById("l_name").textContent = e ? t("namePay") : t("nameGeneric");
+  document.getElementById("l_name").innerHTML = `${e ? t("namePay") : t("nameGeneric")} <span class="req">*</span>`;
   if (!init) {
     if (hasQty) recalc();
     else {
@@ -3316,7 +3366,7 @@ function onMethodChange() {
   document.getElementById("w_cheque").style.display = type === "cheque" ? "grid" : "none";
   document.getElementById("w_bankName").style.display = type === "bank" ? "block" : "none";
   const isExpense = document.querySelector("#txTabs button.on")?.dataset.g === "expense";
-  document.getElementById("l_amount").textContent = amountLabelFor(type, isExpense);
+  document.getElementById("l_amount").innerHTML = `${amountLabelFor(type, isExpense)} <span class="req">*</span>`;
   // utang belum ada uang yg benar2 diterima/dibayarkan - default status ke
   // "belum lunas" tiap kali metode diganti ke utang (masih bisa diubah manual
   // nanti kalau utangnya sudah dilunasi)
@@ -3484,6 +3534,33 @@ function hubStaffListHtml() {
     return av > bv ? mul : av < bv ? -mul : 0;
   });
   const { items, page, totalPages } = paginate(all, hubStaffPage, 10);
+  if (!items.length) return `<div class="empty">${t("noneYet")}</div>`;
+  if (narrow())
+    return (
+      items
+        .map(
+          (u) => `<div class="drill-row">
+      <div class="drill-row-bar" style="background:${u.active ? "var(--green)" : "var(--red)"}"></div>
+      <div style="flex:1;min-width:0">
+        <div class="rowsp" style="gap:8px;align-items:flex-start">
+          <div style="min-width:0">
+            <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.name)}</div>
+            <div class="hint" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.email)}${u.provider === "google" ? " · Google" : ""}</div>
+          </div>
+          <div style="text-align:right;flex:none">
+            <span class="tag ${u.role === "admin" ? "t-adm" : "t-tic"}">${u.role === "admin" ? t("admins") : t("treas")}</span>
+            <div class="hint" style="margin-top:4px">${u.active ? t("active") : t("inactive")}</div>
+          </div>
+        </div>
+        <div class="hint mono" style="margin-top:4px;font-size:12px">${t("lastIn")}: ${u.last ? new Date(u.last).toLocaleString(lang === "id" ? "id-ID" : "en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : t("never")}</div>
+        <div class="rowsp" style="margin-top:8px;gap:8px">
+          ${u.email !== me.email && u.active ? `<button class="btn ghost sm" onclick="startImp('${esc(u.email)}')">${t("loginAs")}</button>` : "<span></span>"}
+          <button class="btn ghost sm" onclick="openUser('${esc(u.email)}')">${t("edit")}</button>
+        </div>
+      </div></div>`,
+        )
+        .join("") + pagerHtml(page, totalPages, "setHubStaffPage")
+    );
   const si = (k) =>
     hubStaffSort.k === k ? (hubStaffSort.dir === "asc" ? " ▲" : " ▼") : "";
   return `<div style="overflow-x:auto"><table><thead><tr>
@@ -3491,11 +3568,9 @@ function hubStaffListHtml() {
     <th class="sortable" onclick="setHubStaffSort('role')">${t("role")}${si("role")}</th>
     <th class="sortable" onclick="setHubStaffSort('active')">${t("status")}${si("active")}</th>
     <th class="sortable" onclick="setHubStaffSort('last')">${t("lastIn")}${si("last")}</th><th></th></tr></thead><tbody>
-    ${
-      items.length
-        ? items
-            .map(
-              (u) => `<tr>
+    ${items
+      .map(
+        (u) => `<tr>
       <td><div style="font-weight:600">${esc(u.name)}</div><div class="hint">${esc(u.email)}${u.provider === "google" ? " · Google" : ""}</div></td>
       <td><span class="tag ${u.role === "admin" ? "t-adm" : "t-tic"}">${u.role === "admin" ? t("admins") : t("treas")}</span></td>
       <td><span class="tag ${u.active ? "t-ok" : "t-exp"}">${u.active ? t("active") : t("inactive")}</span></td>
@@ -3503,10 +3578,8 @@ function hubStaffListHtml() {
       <td style="text-align:right;white-space:nowrap">
         ${u.email !== me.email && u.active ? `<button class="btn ghost sm" onclick="startImp('${esc(u.email)}')">${t("loginAs")}</button> ` : ""}
         <button class="btn ghost sm" onclick="openUser('${esc(u.email)}')">${t("edit")}</button></td></tr>`,
-            )
-            .join("")
-        : `<tr><td colspan="5" class="empty">${t("noneYet")}</td></tr>`
-    }
+      )
+      .join("")}
   </tbody></table></div>${pagerHtml(page, totalPages, "setHubStaffPage")}`;
 }
 function vHubStaff() {
@@ -3664,6 +3737,24 @@ async function startImp(email) {
 }
 
 /* ================= log aktivitas ================= */
+function logRowCardHtml(l) {
+  const isDel = /Delete|Hapus/.test(t(l.act)),
+    isVer = /Verif/.test(t(l.act));
+  return `<div class="drill-row">
+    <div class="drill-row-bar" style="background:${isDel ? "var(--red)" : isVer ? "var(--green)" : "var(--blue)"}"></div>
+    <div style="flex:1;min-width:0">
+      <div class="rowsp" style="gap:8px;align-items:flex-start">
+        <div style="min-width:0">
+          <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(l.user)}</div>
+          <div class="hint" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(l.email)}${l.asAdmin ? " · " + t("byAdmin", { n: esc(l.asAdmin) }) : ""}</div>
+        </div>
+        <span class="tag ${isDel ? "t-exp" : isVer ? "t-ok" : "t-tic"}" style="flex:none">${t(l.act)}</span>
+      </div>
+      ${l.det ? `<div class="hint" style="margin-top:4px">${esc(l.det)}</div>` : ""}
+      <div class="hint mono" style="margin-top:4px;font-size:12px">${new Date(l.ts).toLocaleString(lang === "id" ? "id-ID" : "en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</div>
+    </div>
+  </div>`;
+}
 function logListHtml() {
   const q = logQ.toLowerCase();
   const all = S.logs.filter(
@@ -3672,8 +3763,9 @@ function logListHtml() {
       [l.user, l.email, t(l.act), l.det].join(" ").toLowerCase().includes(q),
   );
   const { items: rows, page, totalPages } = paginate(all, logPage);
-  return rows.length
-    ? `<div style="overflow-x:auto"><table><thead><tr>
+  if (!rows.length) return `<div class="empty">${t("noLog")}</div>`;
+  if (narrow()) return rows.map(logRowCardHtml).join("") + pagerHtml(page, totalPages, "setLogPage");
+  return `<div style="overflow-x:auto"><table><thead><tr>
     <th>${t("time")}</th><th>${t("user")}</th><th>${t("action")}</th><th>${t("info")}</th></tr></thead><tbody>
     ${rows
       .map(
@@ -3683,8 +3775,7 @@ function logListHtml() {
       <td><span class="tag ${/Delete|Hapus/.test(t(l.act)) ? "t-exp" : /Verif/.test(t(l.act)) ? "t-ok" : "t-tic"}">${t(l.act)}</span></td>
       <td class="hint">${esc(l.det)}</td></tr>`,
       )
-      .join("")}</tbody></table></div>${pagerHtml(page, totalPages, "setLogPage")}`
-    : `<div class="empty">${t("noLog")}</div>`;
+      .join("")}</tbody></table></div>${pagerHtml(page, totalPages, "setLogPage")}`;
 }
 function vLogs() {
   return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
@@ -3740,7 +3831,7 @@ function vSet() {
       </tbody></table></div>
       <div><button class="btn ghost sm" style="margin-top:10px" onclick="addCat()">${t("addCat")}</button></div></div>
     <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("methods")}</h2>
-      <div style="overflow-x:auto"><table><thead><tr><th>${t("methodName")}</th><th>${t("methodType")}</th><th></th></tr></thead><tbody>
+      <div style="overflow-x:auto"><table style="min-width:420px"><thead><tr><th style="min-width:160px">${t("methodName")}</th><th style="min-width:160px">${t("methodType")}</th><th></th></tr></thead><tbody>
       ${D()
         .methods.map(
           (m, i) => `<tr><td><input value="${esc(m.name)}" onchange="editMethod(${i},'name',this.value)"></td>
@@ -3758,7 +3849,7 @@ function vSet() {
       <div><button class="btn ghost sm" style="margin-top:10px" onclick="addMethod()">${t("addMethod")}</button></div></div>
     <div class="card"><h2 style="font-size:17px">${t("tplTitle")}</h2>
       <p class="hint" style="margin:4px 0 8px">${t("tplP")}</p>
-      <div style="overflow-x:auto"><table><thead><tr><th>${t("field")}</th><th>${t("colName")}</th><th></th></tr></thead><tbody>
+      <div style="overflow-x:auto"><table style="min-width:480px"><thead><tr><th style="min-width:150px">${t("field")}</th><th style="min-width:220px">${t("colName")}</th><th></th></tr></thead><tbody>
       ${D()
         .tpl.map(
           (c, i) => `<tr><td style="font-weight:600">${
@@ -4730,7 +4821,7 @@ function buildCategorySheet(wb, cat, usedNames, kind, refDate) {
   const tx = S.tx
     .filter((x) => x.status === "verified" && x.cat === cat.n && txInPeriod(x, kind, refDate))
     .sort((a, b) => a.date.localeCompare(b.date));
-  [t("date"), t("name"), t("note"), t("paymentMethod"), t("status"), t("amount")].forEach(
+  [t("date"), t("name"), t("note"), t("paymentMethod"), t("payStatus"), t("amount")].forEach(
     (h, i) => (ws.getCell(row, i + 1).value = h),
   );
   styleHeaderRow(ws, row);
