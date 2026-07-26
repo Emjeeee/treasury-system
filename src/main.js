@@ -625,6 +625,9 @@ const L = {
     actImp: "Masuk sebagai pengguna",
     actClear: "Hapus semua transaksi",
     actSignup: "Daftar akun",
+    actEventCreate: "Buat acara",
+    actEventArchive: "Ubah status acara",
+    actEventDuplicate: "Duplikat acara",
     searchLog: "Cari nama, aksi, atau rincian",
     time: "Waktu",
     user: "Pengguna",
@@ -657,6 +660,9 @@ const L = {
     newEvent: "+ Acara baru",
     archive: "Arsipkan",
     restore: "Aktifkan lagi",
+    duplicate: "Duplikat",
+    duplicateEvent: "Duplikat acara",
+    duplicateEventHint: "Membuat acara baru dengan kategori, metode pembayaran, dan tata letak dashboard yang sama seperti \"{n}\". Transaksi dan log TIDAK ikut disalin.",
     archived: "Diarsipkan",
     chooseEvent: "Pilih acara",
     chooseEventSub: "Anda dipetakan ke beberapa acara. Pilih salah satu untuk mulai.",
@@ -904,6 +910,9 @@ const L = {
     actImp: "Signed in as user",
     actClear: "Deleted all transactions",
     actSignup: "Created account",
+    actEventCreate: "Created event",
+    actEventArchive: "Changed event status",
+    actEventDuplicate: "Duplicated event",
     searchLog: "Search name, action or details",
     time: "Time",
     user: "User",
@@ -936,6 +945,9 @@ const L = {
     newEvent: "+ New event",
     archive: "Archive",
     restore: "Restore",
+    duplicate: "Duplicate",
+    duplicateEvent: "Duplicate event",
+    duplicateEventHint: "Creates a new event with the same categories, payment methods, and dashboard layout as \"{n}\". Transactions and logs are NOT copied.",
     archived: "Archived",
     chooseEvent: "Choose an event",
     chooseEventSub: "You're mapped to more than one event. Pick one to get started.",
@@ -1304,7 +1316,7 @@ function vSetup() {
   if (!setupRec) setupRec = recoveryCode();
   return `<div class="auth"><div class="authbox">
   <div class="rowsp" style="margin-bottom:14px;flex-wrap:wrap;row-gap:10px"><div style="display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 auto">
-    <div class="mark">TS</div><h1 style="font-size:19px">${t("setupT")}</h1></div>
+    <img class="mark" src="/treasurySystem.ico" alt="Treasury System"><h1 style="font-size:19px">${t("setupT")}</h1></div>
     <div style="display:flex;gap:6px;align-items:center;flex:none">${themeBtn()}${langSeg()}</div></div>
   <div class="card" style="padding:20px">
     <p class="hint" style="margin:0 0 14px">${t("setupSub")}</p>
@@ -1367,7 +1379,7 @@ function vAuth() {
   const f = authMode;
   return `<div class="auth"><div class="authbox">
   <div class="rowsp" style="margin-bottom:14px;flex-wrap:wrap;row-gap:10px"><div style="display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 auto">
-    <div class="mark">TS</div><div style="min-width:0"><h1 style="font-size:19px">${f === "forgot" ? t("forgotT") : t("welcome")}</h1>
+    <img class="mark" src="/treasurySystem.ico" alt="Treasury System"><div style="min-width:0"><h1 style="font-size:19px">${f === "forgot" ? t("forgotT") : t("welcome")}</h1>
     <div class="hint">${f === "forgot" ? t("forgotSub") : t("welcomeSub")}</div></div></div>
     <div style="display:flex;gap:6px;align-items:center;flex:none">${themeBtn()}${langSeg()}</div></div>
   <div class="card" style="padding:20px">
@@ -1558,7 +1570,7 @@ function vPicker() {
   const events = myEvents(acting());
   return `<div class="auth"><div class="authbox">
   <div class="rowsp" style="margin-bottom:14px;flex-wrap:wrap;row-gap:10px"><div style="display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 auto">
-    <div class="mark">TS</div><div style="min-width:0"><h1 style="font-size:19px">${t("chooseEvent")}</h1>
+    <img class="mark" src="/treasurySystem.ico" alt="Treasury System"><div style="min-width:0"><h1 style="font-size:19px">${t("chooseEvent")}</h1>
     <div class="hint">${t("chooseEventSub")}</div></div></div>
     <div style="display:flex;gap:6px;align-items:center;flex:none">${themeBtn()}${langSeg()}</div></div>
   <div class="card" style="padding:16px">
@@ -1605,7 +1617,7 @@ function setHubTab(k) {
 function vHub() {
   const a = acting();
   return `<header><div class="wrap">
-    <div class="mark">TS</div>
+    <img class="mark" src="/treasurySystem.ico" alt="Treasury System">
     <div style="flex:1;min-width:0"><h1 style="font-size:17px">${t("adminConsole")}</h1></div>
     ${themeBtn()}
     ${langSeg()}
@@ -1659,9 +1671,12 @@ function hubEventsListHtml() {
           </div>
           <span class="tag ${e.status === "active" ? "t-ok" : "t-exp"}" style="flex:none">${e.status === "active" ? t("active") : t("archived")}</span>
         </div>
-        <div class="rowsp" style="margin-top:8px;gap:8px">
+        <div class="rowsp" style="margin-top:8px;gap:8px;flex-wrap:wrap">
           ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button>` : "<span></span>"}
-          <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
+          <div style="display:flex;gap:8px">
+            <button class="btn ghost sm" onclick="openDuplicateEvent('${e.id}')">${t("duplicate")}</button>
+            <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
+          </div>
         </div>
       </div></div>`,
         )
@@ -1682,6 +1697,7 @@ function hubEventsListHtml() {
       <td><span class="tag ${e.status === "active" ? "t-ok" : "t-exp"}">${e.status === "active" ? t("active") : t("archived")}</span></td>
       <td style="text-align:right;white-space:nowrap">
         ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button> ` : ""}
+        <button class="btn ghost sm" onclick="openDuplicateEvent('${e.id}')">${t("duplicate")}</button>
         <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
       </td></tr>`,
       )
@@ -1728,6 +1744,44 @@ async function createEventSubmit() {
   await mutateHub(() => {
     G.events.push(entry);
   }, "actEventCreate", name);
+  closeSheet();
+  toast(t("saved"));
+  render();
+}
+// beda dari createEventRow() (yg selalu mulai kosong) - baris baru ini
+// mewarisi cats/methods/tpl/dashboard PERSIS dari acara sumber, tapi tx &
+// logs selalu mulai kosong (bukan acara sungguhan, jadi tidak boleh bawa
+// riwayat transaksi acara lain)
+async function duplicateEventRow(srcId, newId, name, date, createdBy) {
+  const r = await window.storage.get(eventKey(srcId), true);
+  const src = r && r.value ? JSON.parse(r.value) : null;
+  const config = src
+    ? { ...src.config, event: name, date: date || "" }
+    : { event: name, date: date || "", cats: [], methods: [], tpl: DEFAULT_TPL, dashboard: { widgets: starterDashboardWidgets() } };
+  await window.storage.set(eventKey(newId), JSON.stringify({ rev: 1, config, tx: [], logs: [] }), true);
+  return { id: newId, name, date: date || "", status: "active", createdAt: now(), createdBy };
+}
+function openDuplicateEvent(id) {
+  const src = G.events.find((e) => e.id === id);
+  if (!src) return;
+  const suggested = src.name + (lang === "id" ? " (Salinan)" : " (Copy)");
+  sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${t("duplicateEvent")}</h2>${closeBtn()}</div>
+    <p class="hint" style="margin:0 0 12px">${t("duplicateEventHint", { n: esc(src.name) })}</p>
+    <input type="hidden" id="dup_src" value="${id}">
+    <div class="field"><label>${t("evName")}</label><input id="dup_name" value="${esc(suggested)}"></div>
+    <div class="field"><label>${t("evDate")}</label><input type="date" id="dup_date" value="${src.date || ""}"></div>
+    <button class="btn wide" onclick="submitDuplicateEvent()">${t("duplicateEvent")}</button>`);
+}
+async function submitDuplicateEvent() {
+  const srcId = val("dup_src"),
+    name = val("dup_name"),
+    date = val("dup_date");
+  if (!name) return toast(t("fillAll"));
+  const srcName = G.events.find((e) => e.id === srcId)?.name || "";
+  const entry = await duplicateEventRow(srcId, "ev_" + uid(), name, date, acting().email);
+  await mutateHub(() => {
+    G.events.push(entry);
+  }, "actEventDuplicate", `${srcName} -> ${name}`);
   closeSheet();
   toast(t("saved"));
   render();
@@ -1864,7 +1918,7 @@ function vApp() {
       : ""
   }
   <header><div class="wrap">
-    <div class="mark">TS</div>
+    <img class="mark" src="/treasurySystem.ico" alt="Treasury System">
     <div style="flex:1;min-width:0"><h1 style="font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(D().event || "Konser")}</h1>
       <div class="sub">${esc(headerSub)}</div></div>
     ${themeBtn()}
@@ -4972,6 +5026,8 @@ Object.assign(window, {
   setHubTab,
   openNewEvent,
   createEventSubmit,
+  openDuplicateEvent,
+  submitDuplicateEvent,
   toggleArchive,
   loadMonitor,
   goDashEditor,
