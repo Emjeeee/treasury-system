@@ -334,6 +334,18 @@ label {
 .field {
   margin-bottom: 11px;
 }
+/* tanda kolom wajib diisi - span terpisah (bukan bagian dari teks label)
+   supaya label yg teksnya diganti dinamis via JS (mis. l_name, l_amount)
+   tidak ikut menghapus tandanya */
+.req {
+  color: var(--red);
+  font-weight: 700;
+}
+.field.invalid input,
+.field.invalid select,
+.field.invalid textarea {
+  border-color: var(--red);
+}
 table {
   width: 100%;
   border-collapse: collapse;
@@ -841,8 +853,9 @@ input[readonly]:hover {
     display: none;
   }
   .xls-btn {
-    padding: 8px;
+    padding: 0;
     width: 34px;
+    height: 34px;
     justify-content: center;
   }
   .seg button {

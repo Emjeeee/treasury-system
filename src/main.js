@@ -105,7 +105,10 @@ let chartInstances = {},
   logQ = "",
   txQ = "",
   txSort = { k: "date", dir: "desc" },
-  exportKind = "week",
+  // default "all" spy angka laporan yg diunduh cocok dgn KPI dashboard
+  // (yg selalu all-time, tidak per-periode) - admin yg memang mau laporan
+  // per-minggu/bulan masih bisa pilih manual di dialog export
+  exportKind = "all",
   monitorCache = null;
 let txPage = 1,
   logPage = 1,
@@ -394,7 +397,7 @@ const trendDownIcon = `<svg width="13" height="13" viewBox="0 0 24 24" fill="non
 const closeBtn = () =>
   `<button type="button" class="btn ghost sm icon" onclick="closeSheet()" aria-label="${t("close")}" title="${t("close")}">${closeIcon}</button>`;
 const proofIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 16l-5-4-4 3-3-2-6 5"/></svg>`;
-const downloadIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>`;
+const downloadIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>`;
 function toast(m) {
   const e = document.createElement("div");
   e.className = "toast";
@@ -478,7 +481,6 @@ const L = {
     saved: "Transaksi tersimpan",
     deleted: "Transaksi dihapus",
     verified: "Ditandai sudah masuk rekening",
-    needAmt: "Nominal belum diisi",
     event: "Acara",
     evName: "Nama acara",
     evDate: "Tanggal acara",
@@ -755,7 +757,6 @@ const L = {
     saved: "Transaction saved",
     deleted: "Transaction deleted",
     verified: "Marked as received",
-    needAmt: "Amount is required",
     event: "Event",
     evName: "Event name",
     evDate: "Event date",
@@ -1239,6 +1240,13 @@ function render() {
     if (tab === "dash") {
       drawChart();
       drawPies();
+      // render() bikin ulang #panelSeg dari nol tiap kali (klik tab, polling
+      // 6dtk, dll) - scrollLeft-nya otomatis balik ke 0 walau tab aktifnya
+      // (class "on") ada di posisi paling kanan, jadi tombol aktif jadi
+      // tersembunyi dari layar mobile. Paksa scroll tombol aktif itu ke
+      // dalam area yg terlihat setiap render, bukan cuma saat awal dibuka.
+      document.getElementById("panelSeg")?.querySelector("button.on")
+        ?.scrollIntoView({ block: "nearest", inline: "nearest" });
     } else if (tab === "admin" && adminTab === "dashboard") initDashGrid();
     else if (dashGrid) {
       dashGrid.destroy(false);
@@ -1605,7 +1613,7 @@ function vHub() {
     }
   </div>`;
 }
-function vHubEvents() {
+function hubEventsListHtml() {
   const q = hubEventsQ.toLowerCase();
   let all = G.events.filter(
     (e) =>
@@ -1622,22 +1630,7 @@ function vHubEvents() {
   const { items, page, totalPages } = paginate(all, hubEventsPage, 10);
   const si = (k) =>
     hubEventsSort.k === k ? (hubEventsSort.dir === "asc" ? " ▲" : " ▼") : "";
-  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
-    <h2 style="font-size:17px">${t("events")}</h2>
-    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
-      <div class="chips">${[
-        ["all", t("all")],
-        ["active", t("active")],
-        ["archived", t("archived")],
-      ]
-        .map(
-          ([k2, l]) =>
-            `<button class="chip ${hubEventsFilter === k2 ? "on" : ""}" onclick="setHubEventsFilter('${k2}')">${l}</button>`,
-        )
-        .join("")}</div>
-      <input style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(hubEventsQ)}" oninput="onHubEventsSearch(this.value)">
-      <button class="btn sm" onclick="openNewEvent()">${t("newEvent")}</button></div></div>
-    <div style="overflow-x:auto"><table><thead><tr>
+  return `<div style="overflow-x:auto"><table><thead><tr>
       <th class="sortable" onclick="setHubEventsSort('name')">${t("name")}${si("name")}</th>
       <th class="sortable" onclick="setHubEventsSort('date')">${t("evDate")}${si("date")}</th>
       <th class="sortable" onclick="setHubEventsSort('status')">${t("status")}${si("status")}</th>
@@ -1658,7 +1651,25 @@ function vHubEvents() {
             .join("")
         : `<tr><td colspan="4" class="empty">${t("noneYet")}</td></tr>`
     }
-    </tbody></table></div>${pagerHtml(page, totalPages, "setHubEventsPage")}</div>`;
+    </tbody></table></div>${pagerHtml(page, totalPages, "setHubEventsPage")}`;
+}
+function vHubEvents() {
+  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="font-size:17px">${t("events")}</h2>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
+      <div class="chips">${[
+        ["all", t("all")],
+        ["active", t("active")],
+        ["archived", t("archived")],
+      ]
+        .map(
+          ([k2, l]) =>
+            `<button class="chip ${hubEventsFilter === k2 ? "on" : ""}" onclick="setHubEventsFilter('${k2}')">${l}</button>`,
+        )
+        .join("")}</div>
+      <input id="hubEventsSearchInput" style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(hubEventsQ)}" oninput="onHubEventsSearch(this.value)">
+      <button class="btn sm" onclick="openNewEvent()">${t("newEvent")}</button></div></div>
+    <div id="hubEventsListBody">${hubEventsListHtml()}</div></div>`;
 }
 function setHubEventsSort(k) {
   hubEventsSort =
@@ -1861,7 +1872,10 @@ function onLogSearch(v) {
   logQ = v;
   logPage = 1;
   clearTimeout(window._lq);
-  window._lq = setTimeout(render, 250);
+  window._lq = setTimeout(() => {
+    const el = document.getElementById("logListBody");
+    if (el) el.innerHTML = logListHtml();
+  }, 250);
 }
 function setLogPage(p) {
   logPage = p;
@@ -1892,7 +1906,10 @@ function onHubEventsSearch(v) {
   hubEventsQ = v;
   hubEventsPage = 1;
   clearTimeout(window._heq);
-  window._heq = setTimeout(render, 250);
+  window._heq = setTimeout(() => {
+    const el = document.getElementById("hubEventsListBody");
+    if (el) el.innerHTML = hubEventsListHtml();
+  }, 250);
 }
 function setHubStaffPage(p) {
   hubStaffPage = p;
@@ -1902,7 +1919,10 @@ function onHubStaffSearch(v) {
   hubStaffQ = v;
   hubStaffPage = 1;
   clearTimeout(window._hsq);
-  window._hsq = setTimeout(render, 250);
+  window._hsq = setTimeout(() => {
+    const el = document.getElementById("hubStaffListBody");
+    if (el) el.innerHTML = hubStaffListHtml();
+  }, 250);
 }
 function setHubStaffSort(k) {
   hubStaffSort =
@@ -2432,7 +2452,7 @@ function vDash() {
     ${
       otherWidgets.length
         ? `<div class="card" style="flex:1.1;gap:6px">
-      <div class="seg" style="align-self:stretch;flex:none;max-width:100%">${otherWidgets
+      <div class="seg" id="panelSeg" style="align-self:stretch;flex:none;max-width:100%">${otherWidgets
         .map(
           (w) =>
             `<button class="${activeId === w.id ? "on" : ""}" onclick="setPanel('${w.id}')">${esc(liveTitle(w.title))}</button>`,
@@ -2827,13 +2847,23 @@ function setTxSort(k) {
   txPage = 1;
   render();
 }
+// pencarian ketik-per-huruf TIDAK BOLEH memicu render() penuh - itu
+// mengganti seluruh #root (termasuk <input> yg sedang difokus) dgn node DOM
+// baru, yg di mobile langsung menutup keyboard tiap kali user mengetik satu
+// huruf. Sebagai gantinya, cuma innerHTML div hasil daftarnya saja yg
+// diperbarui (id="txListCard") - <input>-nya sendiri tidak pernah disentuh,
+// jadi fokus & keyboard tetap terjaga. Pola yg sama dipakai di
+// onLogSearch/onHubEventsSearch/onHubStaffSearch di bawah.
 function onTxSearch(v) {
   txQ = v;
   txPage = 1;
   clearTimeout(window._tq);
-  window._tq = setTimeout(render, 250);
+  window._tq = setTimeout(() => {
+    const el = document.getElementById("txListCard");
+    if (el) el.innerHTML = txListCardHtml();
+  }, 250);
 }
-function vTx() {
+function txListCardHtml() {
   const q = txQ.toLowerCase();
   const all = sortTx(
     S.tx.filter(
@@ -2848,25 +2878,8 @@ function vTx() {
   const { items: f, page, totalPages } = paginate(all, txPage);
   const si = (k) =>
     txSort.k === k ? (txSort.dir === "asc" ? " ▲" : " ▼") : "";
-  return `<div style="padding:12px 0 110px">
-  <div class="rowsp" style="margin-bottom:11px;flex-wrap:wrap;gap:8px">
-    <div class="chips">${[
-      ["all", t("all")],
-      ["pending", t("unchecked")],
-      ["income", t("incomeW")],
-      ["expense", t("expW")],
-    ]
-      .map(
-        ([k, l]) =>
-          `<button class="chip ${filter === k ? "on" : ""}" onclick="setFilter('${k}')">${l}</button>`,
-      )
-      .join("")}</div>
-    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:200px">
-      <input style="max-width:280px" placeholder="${t("searchTx")}" value="${esc(txQ)}" oninput="onTxSearch(this.value)">
-      <button class="btn ghost sm" onclick="openImport()">${t("imp")}</button></div></div>
-  <div class="card" style="padding:2px 10px">${
-    f.length
-      ? `<div style="overflow-x:auto"><table><thead><tr>
+  return f.length
+    ? `<div style="overflow-x:auto"><table><thead><tr>
     <th class="sortable" onclick="setTxSort('date')">${t("date")}${si("date")}</th>
     <th class="sortable" onclick="setTxSort('name')">${t("name")}${si("name")}</th>
     <th>${t("detail")}</th>
@@ -2890,8 +2903,26 @@ function vTx() {
       )
       .join("")}
     </tbody></table></div>${pagerHtml(page, totalPages, "setTxPage")}`
-      : `<div class="empty"><b>${t("noTx")}</b><br>${t("noTxSub")}</div>`
-  }</div></div>`;
+    : `<div class="empty"><b>${t("noTx")}</b><br>${t("noTxSub")}</div>`;
+}
+function vTx() {
+  return `<div style="padding:12px 0 110px">
+  <div class="rowsp" style="margin-bottom:11px;flex-wrap:wrap;gap:8px">
+    <div class="chips">${[
+      ["all", t("all")],
+      ["pending", t("unchecked")],
+      ["income", t("incomeW")],
+      ["expense", t("expW")],
+    ]
+      .map(
+        ([k, l]) =>
+          `<button class="chip ${filter === k ? "on" : ""}" onclick="setFilter('${k}')">${l}</button>`,
+      )
+      .join("")}</div>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:200px">
+      <input id="txSearchInput" style="max-width:280px" placeholder="${t("searchTx")}" value="${esc(txQ)}" oninput="onTxSearch(this.value)">
+      <button class="btn ghost sm" onclick="openImport()">${t("imp")}</button></div></div>
+  <div class="card" id="txListCard" style="padding:2px 10px">${txListCardHtml()}</div></div>`;
 }
 async function verify(id) {
   await mutate(
@@ -2944,25 +2975,25 @@ function openTx(id) {
       <button type="button" class="${initialGroup === "expense" ? "on" : ""}" data-g="expense" onclick="setTxTab('expense')">${t("expW")}</button>
     </div>
     <div class="field" style="margin-bottom:14px">
-      <label id="l_cat">${t("txCat")}</label>
+      <label id="l_cat">${t("txCat")} <span class="req">*</span></label>
       <select id="f_cat" onchange="onCatChange()"></select>
     </div>
     <div class="field" id="w_tier" style="display:none;margin-bottom:14px">
-      <label>${t("tierLbl")}</label>
+      <label>${t("tierLbl")} <span class="req">*</span></label>
       <select id="f_tier" onchange="onTierChange()"></select>
     </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="field"><label>${t("date")}</label><input type="date" id="f_date" value="${x.date}"></div>
-      <div class="field"><label id="l_bank">${t("paymentMethod")}</label><select id="f_bank" onchange="onMethodChange()">${D()
+      <div class="field"><label>${t("date")} <span class="req">*</span></label><input type="date" id="f_date" value="${x.date}"></div>
+      <div class="field"><label id="l_bank">${t("paymentMethod")} <span class="req">*</span></label><select id="f_bank" onchange="onMethodChange()">${D()
         .methods.map(
           (m) =>
             `<option value="${esc(m.name)}" data-type="${m.type}" ${m.name === x.bank ? "selected" : ""}>${esc(m.name)}</option>`,
         )
         .join("")}</select></div>
       <div class="field" id="w_bankName" style="display:none">
-        <label>${t("bankNameLbl")}</label>
+        <label>${t("bankNameLbl")} <span class="req">*</span></label>
         <select id="f_bankName">${INDONESIA_BANKS.map((b) => `<option ${b === x.bankName ? "selected" : ""}>${esc(b)}</option>`).join("")}</select></div>
-      <div class="field" id="w_name"><label id="l_name">${t("nameGeneric")}</label><input id="f_name" value="${esc(x.name)}"></div>
+      <div class="field" id="w_name"><label id="l_name">${t("nameGeneric")}</label> <span class="req">*</span><input id="f_name" value="${esc(x.name)}"></div>
       <div class="field" id="w_phone"><label>${t("wa")}</label><input id="f_phone" inputmode="tel" value="${esc(x.phone)}" placeholder="0812..."></div>
       <div class="field" id="w_seats"><label>${t("nSeat")}</label>
         <div class="stepper">
@@ -2977,7 +3008,7 @@ function openTx(id) {
       <div class="field"><label>${t("chequeDate")}</label><input type="date" id="f_chequeDate" value="${x.chequeDate || ""}"></div>
     </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev();updateBonusHint()">
+      <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label> <span class="req">*</span><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev();updateBonusHint()">
         <div class="hint mono" id="prev" style="margin-top:4px">${rp(x.amount)}</div></div>
       <div class="field"><label>${t("status")}</label><select id="f_status">
         <option value="pending" ${x.status === "pending" ? "selected" : ""}>${t("stW")}</option>
@@ -3294,7 +3325,33 @@ function onMethodChange() {
     if (st) st.value = "pending";
   }
 }
+// kolom bertanda * merah di form wajib diisi - cek di sini sebelum simpan,
+// bukan diam2 dikasih nilai default (dulu nama kosong jadi "—") supaya data
+// yg tersimpan memang benar2 sudah diisi user, bukan hasil tebakan aplikasi
+function invalidTxFields() {
+  const g = (i) => document.getElementById("f_" + i)?.value || "";
+  const methodType = currentMethodType();
+  const catOpt = document.getElementById("f_cat")?.selectedOptions[0];
+  const tiers = catOpt?.dataset.tiers ? JSON.parse(catOpt.dataset.tiers) : [];
+  const bad = [];
+  if (!g("date")) bad.push("f_date");
+  if (!g("cat")) bad.push("f_cat");
+  if (tiers.length && !g("tier")) bad.push("f_tier");
+  if (!g("name").trim()) bad.push("f_name");
+  if (!g("bank")) bad.push("f_bank");
+  if (methodType === "bank" && !g("bankName")) bad.push("f_bankName");
+  if (!(+g("amount") > 0)) bad.push("f_amount");
+  return bad;
+}
 async function saveTx() {
+  document.querySelectorAll("#modal .field.invalid").forEach((el) => el.classList.remove("invalid"));
+  const invalid = invalidTxFields();
+  if (invalid.length) {
+    invalid.forEach((fieldId) => document.getElementById(fieldId)?.closest(".field")?.classList.add("invalid"));
+    toast(t("fillAll"));
+    document.getElementById(invalid[0])?.focus();
+    return;
+  }
   const g = (i) => document.getElementById("f_" + i).value,
     id = g("id"),
     methodType = currentMethodType(),
@@ -3306,7 +3363,7 @@ async function saveTx() {
     id: id || uid(),
     type: ty,
     date: g("date") || today(),
-    name: g("name").trim() || "—",
+    name: g("name").trim(),
     phone: ty === "expense" ? "" : g("phone"),
     cat: g("cat"),
     tier: tiers.length ? g("tier") : "",
@@ -3332,7 +3389,6 @@ async function saveTx() {
         ]),
     ),
   };
-  if (!x.amount) return toast(t("needAmt"));
   await mutate(
     () => {
       const i = S.tx.findIndex((v) => v.id === x.id);
@@ -3413,7 +3469,7 @@ function vAdmin() {
       .join("")}</div>
     ${{ logs: vLogs, set: vSet, dashboard: vDashEditor }[adminTab]()}</div>`;
 }
-function vHubStaff() {
+function hubStaffListHtml() {
   const q = hubStaffQ.toLowerCase();
   let all = G.users.filter(
     (u) =>
@@ -3430,22 +3486,7 @@ function vHubStaff() {
   const { items, page, totalPages } = paginate(all, hubStaffPage, 10);
   const si = (k) =>
     hubStaffSort.k === k ? (hubStaffSort.dir === "asc" ? " ▲" : " ▼") : "";
-  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
-    <h2 style="font-size:17px">${t("staff")}</h2>
-    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
-      <div class="chips">${[
-        ["all", t("all")],
-        ["admin", t("admins")],
-        ["treasurer", t("treas")],
-      ]
-        .map(
-          ([k2, l]) =>
-            `<button class="chip ${hubStaffFilter === k2 ? "on" : ""}" onclick="setHubStaffFilter('${k2}')">${l}</button>`,
-        )
-        .join("")}</div>
-      <input style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(hubStaffQ)}" oninput="onHubStaffSearch(this.value)">
-      <button class="btn sm" onclick="openUser()">${t("addUser")}</button></div></div>
-  <div style="overflow-x:auto"><table><thead><tr>
+  return `<div style="overflow-x:auto"><table><thead><tr>
     <th class="sortable" onclick="setHubStaffSort('name')">${t("name")}${si("name")}</th>
     <th class="sortable" onclick="setHubStaffSort('role')">${t("role")}${si("role")}</th>
     <th class="sortable" onclick="setHubStaffSort('active')">${t("status")}${si("active")}</th>
@@ -3466,7 +3507,25 @@ function vHubStaff() {
             .join("")
         : `<tr><td colspan="5" class="empty">${t("noneYet")}</td></tr>`
     }
-  </tbody></table></div>${pagerHtml(page, totalPages, "setHubStaffPage")}</div>`;
+  </tbody></table></div>${pagerHtml(page, totalPages, "setHubStaffPage")}`;
+}
+function vHubStaff() {
+  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="font-size:17px">${t("staff")}</h2>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
+      <div class="chips">${[
+        ["all", t("all")],
+        ["admin", t("admins")],
+        ["treasurer", t("treas")],
+      ]
+        .map(
+          ([k2, l]) =>
+            `<button class="chip ${hubStaffFilter === k2 ? "on" : ""}" onclick="setHubStaffFilter('${k2}')">${l}</button>`,
+        )
+        .join("")}</div>
+      <input id="hubStaffSearchInput" style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(hubStaffQ)}" oninput="onHubStaffSearch(this.value)">
+      <button class="btn sm" onclick="openUser()">${t("addUser")}</button></div></div>
+  <div id="hubStaffListBody">${hubStaffListHtml()}</div></div>`;
 }
 function setHubStaffFilter(k) {
   hubStaffFilter = k;
@@ -3605,7 +3664,7 @@ async function startImp(email) {
 }
 
 /* ================= log aktivitas ================= */
-function vLogs() {
+function logListHtml() {
   const q = logQ.toLowerCase();
   const all = S.logs.filter(
     (l) =>
@@ -3613,15 +3672,8 @@ function vLogs() {
       [l.user, l.email, t(l.act), l.det].join(" ").toLowerCase().includes(q),
   );
   const { items: rows, page, totalPages } = paginate(all, logPage);
-  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
-    <h2 style="font-size:17px">${t("logs")}</h2>
-    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:220px">
-      <input style="max-width:320px" placeholder="${t("searchLog")}" value="${esc(logQ)}"
-        oninput="onLogSearch(this.value)">
-      <button class="btn ghost sm" onclick="exportLogs()">${t("exportLog")}</button></div></div>
-  ${
-    rows.length
-      ? `<div style="overflow-x:auto"><table><thead><tr>
+  return rows.length
+    ? `<div style="overflow-x:auto"><table><thead><tr>
     <th>${t("time")}</th><th>${t("user")}</th><th>${t("action")}</th><th>${t("info")}</th></tr></thead><tbody>
     ${rows
       .map(
@@ -3632,8 +3684,16 @@ function vLogs() {
       <td class="hint">${esc(l.det)}</td></tr>`,
       )
       .join("")}</tbody></table></div>${pagerHtml(page, totalPages, "setLogPage")}`
-      : `<div class="empty">${t("noLog")}</div>`
-  }</div>`;
+    : `<div class="empty">${t("noLog")}</div>`;
+}
+function vLogs() {
+  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="font-size:17px">${t("logs")}</h2>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:220px">
+      <input id="logSearchInput" style="max-width:320px" placeholder="${t("searchLog")}" value="${esc(logQ)}"
+        oninput="onLogSearch(this.value)">
+      <button class="btn ghost sm" onclick="exportLogs()">${t("exportLog")}</button></div></div>
+  <div id="logListBody">${logListHtml()}</div></div>`;
 }
 async function exportLogs() {
   const ExcelJS = await loadExcelJS();
