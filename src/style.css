@@ -403,6 +403,10 @@ tbody tr:hover {
   color: var(--purple);
   background: var(--purple-s);
 }
+.t-view {
+  color: var(--tx2);
+  background: var(--line2);
+}
 nav {
   position: fixed;
   bottom: 0;

@@ -149,6 +149,14 @@ const narrow = () => window.innerWidth < 960;
 const now = () => new Date().toISOString();
 const acting = () => imp || me; // identitas yang sedang dipakai
 const isAdmin = () => me && me.role === "admin" && !imp; // hak admin hilang saat menyamar
+// role "viewer": cuma bisa lihat data (dashboard), tidak bisa
+// tambah/ubah/hapus apa pun - ikut identitas yg SEDANG aktif (termasuk saat
+// admin menyamar sbg viewer), beda dgn isAdmin() yg sengaja ikut identitas asli
+const canEdit = () => acting()?.role !== "viewer";
+const roleLabel = (role) =>
+  role === "admin" ? t("admins") : role === "viewer" ? t("viewer") : t("treas");
+const roleTagClass = (role) =>
+  role === "admin" ? "t-adm" : role === "viewer" ? "t-view" : "t-tic";
 // potong array jadi satu halaman (dipakai semua tampilan list: transaksi,
 // log, peringkat, acara, staff) supaya tidak perlu scroll ratusan baris
 function paginate(arr, page, size = PAGE_SIZE) {
@@ -446,6 +454,7 @@ const L = {
     noTxSub: "Tekan + Transaksi untuk mencatat yang pertama.",
     newTx: "Catat transaksi",
     editTx: "Ubah transaksi",
+    txDetail: "Detail transaksi",
     close: "Tutup",
     paymentMethod: "Metode pembayaran",
     bankNameLbl: "Bank",
@@ -570,6 +579,8 @@ const L = {
     role: "Peran",
     admins: "Admin",
     treas: "Treasurer",
+    viewer: "Viewer",
+    viewOnlyNotice: "Anda masuk sebagai viewer - hanya dapat melihat data, tidak dapat menambah/mengubah/menghapus.",
     badLogin: "Email atau kata sandi salah.",
     emailUsed: "Email sudah terdaftar.",
     passShort: "Kata sandi minimal 8 karakter.",
@@ -723,6 +734,7 @@ const L = {
     noTxSub: "Tap + Transaction to record the first one.",
     newTx: "Record transaction",
     editTx: "Edit transaction",
+    txDetail: "Transaction detail",
     close: "Close",
     paymentMethod: "Payment method",
     bankNameLbl: "Bank",
@@ -847,6 +859,8 @@ const L = {
     role: "Role",
     admins: "Admin",
     treas: "Treasurer",
+    viewer: "Viewer",
+    viewOnlyNotice: "You're signed in as a viewer - you can only view data, not add/edit/delete it.",
     badLogin: "Wrong email or password.",
     emailUsed: "That email is already registered.",
     passShort: "Password must be at least 8 characters.",
@@ -1837,13 +1851,12 @@ function vApp() {
   ]
     .filter(Boolean)
     .join(" · ");
-  const tabs = [
-    ["dash", t("dash")],
-    ["tx", t("tx")],
-    ["board", t("board")],
-  ];
+  // viewer: cuma boleh lihat Dashboard - tidak ada Transaksi/Peringkat/Admin
+  // di nav, spy tidak ada jalan masuk ke layar yg bisa mengubah data
+  const tabs = canEdit() ? [["dash", t("dash")], ["tx", t("tx")], ["board", t("board")]] : [["dash", t("dash")]];
   if (isAdmin()) tabs.push(["admin", t("admin")]);
   if (tab === "admin" && !isAdmin()) tab = "dash";
+  if ((tab === "tx" || tab === "board") && !canEdit()) tab = "dash";
   return `${
     imp
       ? `<div class="banner">${t("impBanner", { n: esc(imp.name) })}
@@ -1860,7 +1873,7 @@ function vApp() {
     <div class="avatar" onclick="openMe()" title="${esc(a.name)}">${esc(a.name.slice(0, 1).toUpperCase())}</div>
   </div></header>
   <div class="wrap">${{ dash: vDash, tx: vTx, board: vBoard, admin: vAdmin }[tab]()}</div>
-  ${tab === "tx" || tab === "dash" ? `<button class="btn fab" onclick="openTx()">${t("add")}</button>` : ""}
+  ${(tab === "tx" || tab === "dash") && canEdit() ? `<button class="btn fab" onclick="openTx()">${t("add")}</button>` : ""}
   <nav>${tabs.map(([k, l]) => `<button class="${tab === k ? "on" : ""}" onclick="go('${k}')"><span class="dot"></span>${l}</button>`).join("")}</nav>`;
 }
 function go(k) {
@@ -1959,7 +1972,7 @@ function openMe() {
   sheet(`<div class="rowsp" style="margin-bottom:12px"><h2 style="font-size:19px">${esc(a.name)}</h2>
     ${closeBtn()}</div>
     <div class="hint" style="margin-bottom:6px">${esc(a.email)}</div>
-    <span class="tag ${a.role === "admin" ? "t-adm" : "t-tic"}">${a.role === "admin" ? t("admins") : t("treas")}</span>
+    <span class="tag ${roleTagClass(a.role)}">${roleLabel(a.role)}</span>
     ${
       imp
         ? `<p class="hint" style="margin-top:12px">${t("byAdmin", { n: esc(me.name) })}</p>
@@ -2354,7 +2367,7 @@ function renderQueueWidget(w) {
         (x) => `<div class="rowsp drill" style="padding:7px 0;border-top:1px solid var(--line2)" onclick="openTx('${x.id}')">
     <div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.name)}</div>
     <div class="hint mono">${rpk(x.amount)} · ${esc(x.bank || "-")}</div></div>
-    <button class="btn ok sm" onclick="event.stopPropagation();verify('${x.id}')">${t("inRek")}</button></div>`,
+    ${canEdit() ? `<button class="btn ok sm" onclick="event.stopPropagation();verify('${x.id}')">${t("inRek")}</button>` : `<span class="tag t-wait">${t("stW")}</span>`}</div>`,
       )
       .join("") || `<div class="hint" style="padding-top:10px">${t("noQueue")}</div>`
   }</div>`;
@@ -2975,6 +2988,7 @@ function vTx() {
   <div class="card" id="txListCard" style="padding:2px 10px">${txListCardHtml()}</div></div>`;
 }
 async function verify(id) {
+  if (!canEdit()) return; // jaring pengaman - UI viewer seharusnya sudah tidak menampilkan tombol ini
   await mutate(
     () => {
       const x = S.tx.find((v) => v.id === id);
@@ -3017,8 +3031,14 @@ function openTx(id) {
     return;
   }
   const initialGroup = x.type === "expense" ? "expense" : "income";
-  sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${id ? t("editTx") : t("newTx")}</h2>
+  // viewer: tampilkan detail transaksi tanpa kemampuan mengubah apa pun -
+  // seluruh isi form dibungkus pointer-events:none (satu titik kontrol,
+  // bukan menandai "disabled" di puluhan field satu per satu), kecuali
+  // gambar bukti transfer yg tetap boleh diklik utk dilihat (aksi baca)
+  const readOnly = !canEdit();
+  sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${readOnly ? t("txDetail") : id ? t("editTx") : t("newTx")}</h2>
       ${closeBtn()}</div>
+    <div id="txFormBody" style="${readOnly ? "pointer-events:none;opacity:.7" : ""}">
     <input type="hidden" id="f_id" value="${x.id}"><input type="hidden" id="f_type" value="${x.type}">
     <div class="seg" id="txTabs" style="margin-bottom:14px">
       <button type="button" class="${initialGroup === "income" ? "on" : ""}" data-g="income" onclick="setTxTab('income')">${t("incomeW")}</button>
@@ -3073,7 +3093,7 @@ function openTx(id) {
       </div>
       <input type="file" id="f_proofFile" accept="image/*" style="display:none" onchange="onProofChange(event)">
       <div class="hint" style="margin-top:4px">${t("proofHint")}</div>
-      <div class="proof-prev" id="proofPrev" style="margin-top:8px">${x.proof ? `<img src="${x.proof}" onclick="viewProofPreview()">` : ""}</div>
+      <div class="proof-prev" id="proofPrev" style="margin-top:8px${readOnly ? ";pointer-events:auto" : ""}">${x.proof ? `<img src="${x.proof}" onclick="viewProofPreview()">` : ""}</div>
       <input type="hidden" id="f_proof" value="${esc(x.proof || "")}"></div>
     ${(() => {
       const cf = D().tpl.filter((c) => c.custom);
@@ -3086,11 +3106,18 @@ function openTx(id) {
           )
           .join("")}</div></div>`;
     })()}
-    <div class="rowsp" style="margin-top:14px">${id ? `<button class="btn danger" onclick="delTx('${id}')">${t("del")}</button>` : "<span></span>"}
-      <button class="btn" onclick="saveTx()">${t("save")}</button></div>`);
+    </div>
+    ${
+      readOnly
+        ? ""
+        : `<div class="rowsp" style="margin-top:14px">${id ? `<button class="btn danger" onclick="delTx('${id}')">${t("del")}</button>` : "<span></span>"}
+      <button class="btn" onclick="saveTx()">${t("save")}</button></div>`
+    }`);
   setTxTab(initialGroup, x);
-  initCombobox("f_cat");
-  initCombobox("f_bankName");
+  if (!readOnly) {
+    initCombobox("f_cat");
+    initCombobox("f_bankName");
+  }
 }
 function sheet(html) {
   const m = document.createElement("div");
@@ -3394,6 +3421,7 @@ function invalidTxFields() {
   return bad;
 }
 async function saveTx() {
+  if (!canEdit()) return; // jaring pengaman - UI viewer seharusnya sudah read-only
   document.querySelectorAll("#modal .field.invalid").forEach((el) => el.classList.remove("invalid"));
   const invalid = invalidTxFields();
   if (invalid.length) {
@@ -3452,6 +3480,7 @@ async function saveTx() {
   render();
 }
 async function delTx(id) {
+  if (!canEdit()) return; // jaring pengaman - UI viewer seharusnya sudah read-only
   if (!confirm(t("confirmDel"))) return;
   const x = S.tx.find((v) => v.id === id) || {};
   await mutate(
@@ -3548,7 +3577,7 @@ function hubStaffListHtml() {
             <div class="hint" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.email)}${u.provider === "google" ? " · Google" : ""}</div>
           </div>
           <div style="text-align:right;flex:none">
-            <span class="tag ${u.role === "admin" ? "t-adm" : "t-tic"}">${u.role === "admin" ? t("admins") : t("treas")}</span>
+            <span class="tag ${roleTagClass(u.role)}">${roleLabel(u.role)}</span>
             <div class="hint" style="margin-top:4px">${u.active ? t("active") : t("inactive")}</div>
           </div>
         </div>
@@ -3572,7 +3601,7 @@ function hubStaffListHtml() {
       .map(
         (u) => `<tr>
       <td><div style="font-weight:600">${esc(u.name)}</div><div class="hint">${esc(u.email)}${u.provider === "google" ? " · Google" : ""}</div></td>
-      <td><span class="tag ${u.role === "admin" ? "t-adm" : "t-tic"}">${u.role === "admin" ? t("admins") : t("treas")}</span></td>
+      <td><span class="tag ${roleTagClass(u.role)}">${roleLabel(u.role)}</span></td>
       <td><span class="tag ${u.active ? "t-ok" : "t-exp"}">${u.active ? t("active") : t("inactive")}</span></td>
       <td class="hint mono">${u.last ? new Date(u.last).toLocaleString(lang === "id" ? "id-ID" : "en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : t("never")}</td>
       <td style="text-align:right;white-space:nowrap">
@@ -3590,6 +3619,7 @@ function vHubStaff() {
         ["all", t("all")],
         ["admin", t("admins")],
         ["treasurer", t("treas")],
+        ["viewer", t("viewer")],
       ]
         .map(
           ([k2, l]) =>
@@ -3628,6 +3658,7 @@ function openUser(email) {
     <div class="grid" style="grid-template-columns:1fr 1fr">
       <div class="field"><label>${t("role")}</label><select id="v_role" onchange="document.getElementById('v_events_wrap').style.display=this.value==='admin'?'none':'block'">
         <option value="treasurer" ${u.role === "treasurer" ? "selected" : ""}>${t("treas")}</option>
+        <option value="viewer" ${u.role === "viewer" ? "selected" : ""}>${t("viewer")}</option>
         <option value="admin" ${u.role === "admin" ? "selected" : ""}>${t("admins")}</option></select></div>
       <div class="field"><label>${t("status")}</label><select id="v_active">
         <option value="1" ${u.active ? "selected" : ""}>${t("active")}</option>
@@ -3699,7 +3730,7 @@ async function saveUser() {
         });
     },
     "actUser",
-    `${old ? t("userSaved") : t("userAdded")}: ${n} (${role === "admin" ? t("admins") : t("treas")})`,
+    `${old ? t("userSaved") : t("userAdded")}: ${n} (${roleLabel(role)})`,
   );
   if (me.email === old) me = G.users.find((x) => x.email === old);
   closeSheet();
