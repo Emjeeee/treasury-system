@@ -628,6 +628,7 @@ const L = {
     actEventCreate: "Buat acara",
     actEventArchive: "Ubah status acara",
     actEventDuplicate: "Duplikat acara",
+    actEventDelete: "Hapus permanen acara",
     searchLog: "Cari nama, aksi, atau rincian",
     time: "Waktu",
     user: "Pengguna",
@@ -662,7 +663,10 @@ const L = {
     restore: "Aktifkan lagi",
     duplicate: "Duplikat",
     duplicateEvent: "Duplikat acara",
-    duplicateEventHint: "Membuat acara baru dengan kategori, metode pembayaran, dan tata letak dashboard yang sama seperti \"{n}\". Transaksi dan log TIDAK ikut disalin.",
+    duplicateEventHint: "Membuat acara baru dengan kategori, metode pembayaran, tata letak dashboard, dan seluruh transaksi yang sama seperti \"{n}\". Log aktivitas TIDAK ikut disalin.",
+    deleteEvent: "Hapus permanen",
+    confirmDeleteEvent: "Hapus acara \"{n}\" secara permanen? Semua transaksi, pengaturan, dan riwayatnya akan hilang selamanya. Tindakan ini tidak bisa dibatalkan.",
+    eventDeleted: "Acara dihapus permanen",
     archived: "Diarsipkan",
     chooseEvent: "Pilih acara",
     chooseEventSub: "Anda dipetakan ke beberapa acara. Pilih salah satu untuk mulai.",
@@ -913,6 +917,7 @@ const L = {
     actEventCreate: "Created event",
     actEventArchive: "Changed event status",
     actEventDuplicate: "Duplicated event",
+    actEventDelete: "Permanently deleted event",
     searchLog: "Search name, action or details",
     time: "Time",
     user: "User",
@@ -947,7 +952,10 @@ const L = {
     restore: "Restore",
     duplicate: "Duplicate",
     duplicateEvent: "Duplicate event",
-    duplicateEventHint: "Creates a new event with the same categories, payment methods, and dashboard layout as \"{n}\". Transactions and logs are NOT copied.",
+    duplicateEventHint: "Creates a new event with the same categories, payment methods, dashboard layout, and all transactions from \"{n}\". Activity logs are NOT copied.",
+    deleteEvent: "Delete permanently",
+    confirmDeleteEvent: "Permanently delete \"{n}\"? All its transactions, settings, and history will be lost forever. This cannot be undone.",
+    eventDeleted: "Event permanently deleted",
     archived: "Archived",
     chooseEvent: "Choose an event",
     chooseEventSub: "You're mapped to more than one event. Pick one to get started.",
@@ -1673,9 +1681,10 @@ function hubEventsListHtml() {
         </div>
         <div class="rowsp" style="margin-top:8px;gap:8px;flex-wrap:wrap">
           ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button>` : "<span></span>"}
-          <div style="display:flex;gap:8px">
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn ghost sm" onclick="openDuplicateEvent('${e.id}')">${t("duplicate")}</button>
             <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
+            ${e.status === "archived" ? `<button class="btn danger sm" onclick="deleteEventPermanent('${e.id}')">${t("deleteEvent")}</button>` : ""}
           </div>
         </div>
       </div></div>`,
@@ -1699,6 +1708,7 @@ function hubEventsListHtml() {
         ${e.status === "active" ? `<button class="btn ghost sm" onclick="switchEvent('${e.id}')">${t("enterWorkspace")}</button> ` : ""}
         <button class="btn ghost sm" onclick="openDuplicateEvent('${e.id}')">${t("duplicate")}</button>
         <button class="btn ghost sm" onclick="toggleArchive('${e.id}')">${e.status === "active" ? t("archive") : t("restore")}</button>
+        ${e.status === "archived" ? `<button class="btn danger sm" onclick="deleteEventPermanent('${e.id}')">${t("deleteEvent")}</button>` : ""}
       </td></tr>`,
       )
       .join("")}
@@ -1749,16 +1759,19 @@ async function createEventSubmit() {
   render();
 }
 // beda dari createEventRow() (yg selalu mulai kosong) - baris baru ini
-// mewarisi cats/methods/tpl/dashboard PERSIS dari acara sumber, tapi tx &
-// logs selalu mulai kosong (bukan acara sungguhan, jadi tidak boleh bawa
-// riwayat transaksi acara lain)
+// mewarisi cats/methods/tpl/dashboard DAN transaksinya dari acara sumber
+// (id transaksi dibuat ulang spy tidak ada dua baris beda acara yg
+// kebetulan berbagi id yg sama). Log aktivitas TIDAK ikut disalin - log
+// mencatat siapa melakukan apa & kapan sungguhan terjadi, menyalinnya ke
+// acara baru akan menyesatkan (seolah-olah kejadian itu terjadi di sana)
 async function duplicateEventRow(srcId, newId, name, date, createdBy) {
   const r = await window.storage.get(eventKey(srcId), true);
   const src = r && r.value ? JSON.parse(r.value) : null;
   const config = src
     ? { ...src.config, event: name, date: date || "" }
     : { event: name, date: date || "", cats: [], methods: [], tpl: DEFAULT_TPL, dashboard: { widgets: starterDashboardWidgets() } };
-  await window.storage.set(eventKey(newId), JSON.stringify({ rev: 1, config, tx: [], logs: [] }), true);
+  const tx = src ? src.tx.map((x) => ({ ...x, id: uid() })) : [];
+  await window.storage.set(eventKey(newId), JSON.stringify({ rev: 1, config, tx, logs: [] }), true);
   return { id: newId, name, date: date || "", status: "active", createdAt: now(), createdBy };
 }
 function openDuplicateEvent(id) {
@@ -1792,6 +1805,27 @@ async function toggleArchive(id) {
   await mutateHub(() => {
     G.events.find((x) => x.id === id).status = next;
   }, "actEventArchive", e.name + " -> " + next);
+  render();
+}
+// permanen di sini berarti sungguh2 hilang, bukan cuma disembunyikan spt
+// arsip - baris kv_store acaranya sendiri TIDAK BISA di-DELETE (RLS anon
+// cuma izinkan SELECT/INSERT/UPDATE, sengaja tanpa DELETE), jadi "dihapus"
+// diwujudkan dgn mengosongkan isinya (pola yg sama dipakai membersihkan
+// baris test_* selama pengembangan). Dibatasi hanya utk acara yg SUDAH
+// diarsipkan dulu - dua langkah (arsip -> hapus) sbg jaring pengaman spy
+// tidak kepencet menghapus acara yg masih aktif dipakai staff.
+async function deleteEventPermanent(id) {
+  const e = G.events.find((x) => x.id === id);
+  if (!e || e.status !== "archived") return;
+  if (!confirm(t("confirmDeleteEvent", { n: e.name }))) return;
+  await mutateHub(() => {
+    G.events = G.events.filter((x) => x.id !== id);
+    G.users.forEach((u) => {
+      if (u.eventIds?.length) u.eventIds = u.eventIds.filter((eid) => eid !== id);
+    });
+  }, "actEventDelete", e.name);
+  await window.storage.set(eventKey(id), "", true);
+  toast(t("eventDeleted"));
   render();
 }
 // mengambil data tiap acara sekaligus, hanya saat tab Monitoring dibuka -
@@ -5029,6 +5063,7 @@ Object.assign(window, {
   openDuplicateEvent,
   submitDuplicateEvent,
   toggleArchive,
+  deleteEventPermanent,
   loadMonitor,
   goDashEditor,
   openWidgetForm,
