@@ -8,6 +8,16 @@ async function loadExcelJS() {
   if (!_ExcelJS) _ExcelJS = (await import("exceljs")).default;
   return _ExcelJS;
 }
+let _GridStack = null;
+// editor drag/resize dashboard cuma dipakai admin, sekali-sekali - jangan
+// muat gridstack (+ CSS-nya) di bundle utama yg selalu diunduh semua orang
+async function loadGridstack() {
+  if (!_GridStack) {
+    await import("gridstack/dist/gridstack.min.css");
+    _GridStack = (await import("gridstack")).GridStack;
+  }
+  return _GridStack;
+}
 
 /* ================= penyimpanan ================= */
 // prefix isolasi untuk verifikasi/testing, jangan pernah sentuh key produksi
@@ -16,28 +26,39 @@ const SKEY = KEY_PREFIX + "ct_shared_v4",
   HKEY = KEY_PREFIX + "ct_events_index_v1",
   LKEY = KEY_PREFIX + "ct_session_v4";
 const eventKey = (id) => KEY_PREFIX + "ct_event_" + id + "_v1";
+// (*) = kolom wajib diisi saat impor, lihat parseRows()
 const DEFAULT_TPL = [
-  { f: "no", h: "No" },
-  { f: "name", h: "Nama" },
-  { f: "phone", h: "No. WhatsApp" },
-  { f: "type", h: "Jenis" },
-  { f: "cat", h: "Kategori" },
-  { f: "seats", h: "Jumlah Kursi" },
-  { f: "debit", h: "Debit (Rp)" },
-  { f: "credit", h: "Kredit (Rp)" },
-  { f: "bank", h: "Rekening" },
-  { f: "status", h: "Status" },
-  { f: "note", h: "Catatan" },
-  { f: "date", h: "Tanggal" },
+  { f: "date", h: "Tanggal*" },
+  { f: "name", h: "Nama*" },
+  { f: "phone", h: "Nomor WhatsApp" },
+  { f: "cat", h: "Kategori*" },
+  { f: "note", h: "Keterangan" },
+  { f: "note2", h: "Keterangan Tambahan" },
+  { f: "amount", h: "Nominal*" },
+  { f: "bank", h: "Metode Pembayaran*" },
+  { f: "bankName", h: "Bank" },
+  { f: "status", h: "Status*" },
 ];
-const CASH_DENOMS = [100000, 50000, 20000, 10000, 5000, 2000, 1000];
 // id statis (bukan uid()) supaya bisa dipanggil saat modul dimuat, sebelum
 // uid() sendiri didefinisikan lebih bawah di file ini
 const DEFAULT_METHODS = () => [
-  { id: "m_bca", name: "BCA", type: "bank" },
-  { id: "m_livin", name: "Livin Mandiri", type: "bank" },
-  { id: "m_bri", name: "BRI", type: "bank" },
+  { id: "m_bank", name: "Transfer Bank", type: "bank" },
   { id: "m_tunai", name: "Tunai", type: "cash" },
+  { id: "m_cek", name: "Cek/Giro", type: "cheque" },
+  { id: "m_utang", name: "Utang", type: "debt" },
+];
+// daftar bank umum di Indonesia - dipakai sbg field tambahan "Bank" pas
+// metode pembayaran yg dipilih bertipe "bank" (lihat onMethodChange())
+const INDONESIA_BANKS = [
+  "BCA", "Bank Mandiri", "BRI", "BNI", "CIMB Niaga", "Bank Danamon", "Bank Permata",
+  "BTN", "BSI (Bank Syariah Indonesia)", "Bank Muamalat", "OCBC NISP", "Panin Bank",
+  "Maybank Indonesia", "UOB Indonesia", "HSBC Indonesia", "Bank Jago", "SeaBank",
+  "Jenius (BTPN)", "Bank Mega", "Bank Sinarmas", "Bank BJB", "Bank DKI", "Bank Jateng",
+  "Bank Jatim", "Bank Sumut", "Bank Nagari", "Bank Riau Kepri", "Bank Sumsel Babel",
+  "Bank Kalbar", "Bank Kaltimtara", "Bank Sulselbar", "Bank NTB Syariah", "Bank Bali",
+  "Commonwealth Bank", "Standard Chartered", "Citibank", "DBS Indonesia", "ANZ Indonesia",
+  "Bank Woori Saudara", "Bank Sahabat Sampoerna", "Bank Neo Commerce", "Allo Bank",
+  "Bank Index", "Bank Ganesha", "Bank Victoria", "Lainnya",
 ];
 // ubah config.banks (daftar nama string, versi lama) jadi config.methods
 // (daftar {id,name,type}) - dipanggil begitu acara dimuat, sekali per acara
@@ -56,8 +77,8 @@ let S = {
     event: "Konser Amal 2026",
     date: "",
     cats: [
-      { n: "Reguler", p: 150000, q: 300 },
-      { n: "VIP", p: 400000, q: 80 },
+      { id: "c_reg", n: "Reguler", group: "income", hasQty: true, p: 150000, q: 300 },
+      { id: "c_vip", n: "VIP", group: "income", hasQty: true, p: 400000, q: 80 },
     ],
     methods: DEFAULT_METHODS(),
     tpl: DEFAULT_TPL,
@@ -78,7 +99,8 @@ let screen = "boot",
   adminTab = "set",
   hubTab = "events",
   authMode = "in";
-let chart1 = null,
+let chartInstances = {},
+  dashGrid = null,
   pendingImp = [],
   logQ = "",
   txQ = "",
@@ -116,6 +138,9 @@ const esc = (s) =>
     /[&<>"]/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
   );
+// kategori bertingkat (mis. "Pembelian Kursi" + tier "Platinum") ditampilkan
+// gabungan dimana pun kategori transaksi muncul di UI/laporan
+const catLabel = (x) => (x.tier ? `${x.cat} - ${x.tier}` : x.cat || "");
 const today = () => new Date().toISOString().slice(0, 10);
 const narrow = () => window.innerWidth < 960;
 const now = () => new Date().toISOString();
@@ -130,9 +155,9 @@ function paginate(arr, page, size = PAGE_SIZE) {
 }
 function pagerHtml(page, totalPages, setter) {
   if (totalPages <= 1) return "";
-  return `<div class="rowsp" style="margin-top:10px;flex:none;justify-content:center;gap:14px">
+  return `<div class="rowsp pager" style="flex:none;justify-content:center;gap:20px">
     <button class="btn ghost sm icon" ${page <= 1 ? "disabled" : ""} onclick="${setter}(${page - 1})" aria-label="prev">‹</button>
-    <span class="hint mono">${page} / ${totalPages}</span>
+    <span class="hint mono" style="min-width:52px;text-align:center">${page} / ${totalPages}</span>
     <button class="btn ghost sm icon" ${page >= totalPages ? "disabled" : ""} onclick="${setter}(${page + 1})" aria-label="next">›</button>
   </div>`;
 }
@@ -348,7 +373,14 @@ async function createEventRow(id, name, date, createdBy) {
     eventKey(id),
     JSON.stringify({
       rev: 1,
-      config: { event: name, date: date || "", cats: [], methods: [], tpl: DEFAULT_TPL },
+      config: {
+        event: name,
+        date: date || "",
+        cats: [],
+        methods: [],
+        tpl: DEFAULT_TPL,
+        dashboard: { widgets: starterDashboardWidgets() },
+      },
       tx: [],
       logs: [],
     }),
@@ -357,6 +389,8 @@ async function createEventRow(id, name, date, createdBy) {
   return { id, name, date: date || "", status: "active", createdAt: now(), createdBy };
 }
 const closeIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
+const trendUpIcon = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6 4 4 6-8"/><path d="M14 7h6v6"/></svg>`;
+const trendDownIcon = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7l6 6 4-4 6 8"/><path d="M14 17h6v-6"/></svg>`;
 const closeBtn = () =>
   `<button type="button" class="btn ghost sm icon" onclick="closeSheet()" aria-label="${t("close")}" title="${t("close")}">${closeIcon}</button>`;
 const proofIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 16l-5-4-4 3-3-2-6 5"/></svg>`;
@@ -379,27 +413,27 @@ const L = {
     set: "Pengaturan",
     users: "Pengguna",
     logs: "Log aktivitas",
-    xls: "Unduh Excel",
+    xls: "Unduh Laporan",
     add: "+ Transaksi",
     net: "Saldo bersih",
     ticket: "Penjualan kursi",
     don: "Donasi & investor",
+    incomeW: "Penerimaan",
     exp: "Pengeluaran",
-    wait: "Menunggu cek mutasi",
-    trend: "Pemasukan {n} hari terakhir",
+    wait: "Belum lunas",
+    trend: "Penerimaan {n} hari terakhir",
     seats: "Ketersediaan kursi",
     left: "kursi tersisa",
     soldOf: "{a} terjual dari {b}",
-    queue: "Antre cek mutasi",
-    noQueue: "Semua transaksi sudah diverifikasi.",
+    queue: "Belum lunas",
+    noQueue: "Semua transaksi sudah lunas.",
     topBuy: "Pembeli kursi terbanyak",
     topDon: "Donatur & investor terbesar",
-    inRek: "Masuk",
+    inRek: "Lunas",
     edit: "Ubah",
     all: "Semua",
     unchecked: "Belum dicek",
     seatsW: "Kursi",
-    donW: "Donasi",
     expW: "Pengeluaran",
     date: "Tanggal",
     name: "Nama",
@@ -410,22 +444,23 @@ const L = {
     newTx: "Catat transaksi",
     editTx: "Ubah transaksi",
     close: "Tutup",
-    tBuy: "Pembelian kursi",
-    tDon: "Donasi / investor",
-    tExp: "Pengeluaran",
-    bankTo: "Rekening penerima",
-    bankFrom: "Sumber dana",
-    nameBuy: "Nama pembeli",
-    nameDon: "Nama donatur / investor",
+    paymentMethod: "Metode pembayaran",
+    bankNameLbl: "Bank",
+    nameGeneric: "Nama",
     namePay: "Dibayarkan kepada",
+    tierLbl: "Tipe",
+    searchPlaceholder: "Cari...",
     wa: "Nomor WhatsApp",
-    catSeat: "Kategori kursi",
-    catFree: "Kategori kursi gratis",
+    txCat: "Kategori",
+    noCatYet: "Belum ada kategori. Tambahkan dulu di Pengaturan.",
     nSeat: "Jumlah kursi",
-    purpose: "Keperluan",
     amtIn: "Nominal transfer",
     amtOut: "Nominal pengeluaran",
+    amtCash: "Jumlah tunai",
+    amtCheque: "Nominal cek",
+    amtDebt: "Nominal utang",
     note: "Catatan bukti transfer",
+    note2: "Keterangan tambahan",
     proof: "Bukti transfer (gambar)",
     proofBig: "Ukuran gambar maksimal 8 MB",
     proofHint: "Foto otomatis dikecilkan agar hemat penyimpanan",
@@ -434,9 +469,9 @@ const L = {
     fileAttached: "Gambar terpasang",
     viewProof: "Lihat bukti",
     searchTx: "Cari nama, telepon, catatan, rekening...",
-    status: "Status uang",
-    stW: "Menunggu cek mutasi",
-    stV: "Sudah masuk rekening",
+    status: "Status pembayaran",
+    stW: "Belum lunas",
+    stV: "Lunas",
     save: "Simpan transaksi",
     saveGeneric: "Simpan",
     del: "Hapus",
@@ -454,23 +489,38 @@ const L = {
     methodCash: "Tunai",
     methodCheque: "Cek",
     methodOther: "Lainnya",
+    methodDebt: "Utang",
     addMethod: "+ Tambah metode",
-    cashBreakdown: "Rincian pecahan uang",
-    cashTotal: "Total tunai",
     chequeNo: "No. cek",
     chequeBank: "Bank penerbit",
     chequeDate: "Tanggal cair",
     saveSet: "Simpan pengaturan",
     setSaved: "Pengaturan disimpan",
-    catTitle: "Kategori kursi",
+    catTitle: "Kategori transaksi",
     price: "Harga",
     quota: "Kuota",
+    groupLbl: "Kelompok",
+    qtyLbl: "Lacak jumlah",
+    tiersFor: "Tingkat harga: {n}",
+    tiersHint: "Tambahkan tingkat/tipe dengan harga berbeda (mis. Platinum/Gold/Silver). Kategori dengan tingkat akan menampilkan pilihan tipe di form transaksi.",
+    tierName: "Nama tingkat",
+    addTier: "+ Tambah tingkat",
+    tiersBtn: "Tingkat ({n})",
+    bonusRulesTitle: "Bonus otomatis",
+    bonusRulesHint: "Contoh: sponsor minimal Rp 20 juta berhak dapat 2 kursi Platinum gratis. Ini hanya pengingat di form transaksi - transaksi kursi gratisnya tetap dicatat manual.",
+    bonusMinAmt: "Nominal minimal",
+    bonusTargetCat: "Kategori hadiah",
+    bonusTargetTier: "Tingkat",
+    bonusQty: "Jumlah gratis",
+    addBonusRule: "+ Tambah aturan bonus",
+    bonusNeedsTiers: "Buat kategori bertingkat dulu (mis. Pembelian Kursi) sebelum menambah aturan bonus.",
+    bonusHint: "Berhak mendapat {qty} {cat} tingkat {tier} gratis. Catat sebagai transaksi terpisah dengan nominal Rp 0.",
     addCat: "+ Tambah kategori",
     dataT: "Data",
     dataP: "Data tersimpan bersama untuk semua pengguna aplikasi ini.",
     clearAll: "Hapus semua transaksi",
     cleared: "Semua transaksi dihapus",
-    imp: "Impor data",
+    imp: "Unggah Data",
     impDrop: "Pilih berkas Excel atau CSV",
     impSub: "Gunakan template agar kolom terbaca otomatis",
     dlTpl: "Unduh template",
@@ -480,6 +530,13 @@ const L = {
     colName: "Nama kolom di berkas",
     prev: "Pratinjau impor",
     rowsOk: "{n} baris siap diimpor",
+    txCount: "{n} transaksi",
+    drillSearchPlaceholder: "Cari nama, kategori, nominal, atau status...",
+    txCountLbl: "transaksi",
+    totalLbl: "total",
+    changeLbl: "Perubahan",
+    dailyBalanceHint: "Saldo kumulatif per hari, dibandingkan hari sebelumnya (H-1).",
+    vsYesterday: "vs kemarin",
     rowsBad: "{n} baris dilewati",
     doImp: "Impor {n} baris",
     imported: "{n} transaksi diimpor",
@@ -599,6 +656,31 @@ const L = {
     recorded: "Dicatat",
     refresh: "Segarkan",
     verified: "Diverifikasi",
+    dashboardTab: "Dashboard",
+    editDashboard: "Atur dashboard",
+    dashEditorHint: "Geser & ubah ukuran widget, lalu simpan tata letaknya.",
+    addWidget: "+ Tambah widget",
+    saveLayout: "Simpan tata letak",
+    widgetType: "Jenis widget",
+    widgetTitleLbl: "Judul widget",
+    metricLbl: "Angka yang ditampilkan",
+    catFilterLbl: "Batasi ke kategori",
+    catFilterHint: "Kosongkan (tidak ada yang dipilih) untuk memakai semua kategori di kelompok ini.",
+    wKpi: "Kartu angka",
+    wChart: "Grafik tren",
+    wPie: "Grafik pai",
+    wTable: "Tabel transaksi",
+    wBreakdown: "Rincian per kategori",
+    wQuota: "Kuota / ketersediaan",
+    wQueue: "Antrean menunggu",
+    wRank: "Papan peringkat",
+    chartStyleLbl: "Tampilan grafik",
+    chartStyleBar: "Batang",
+    chartStyleLine: "Garis",
+    allTypesLbl: "Semua",
+    ofTotal: "dari total",
+    clickForDetail: "Klik untuk lihat detail",
+    tableMoreHint: "+{n} transaksi lain, buka penuh di tab Transaksi",
   },
   en: {
     dash: "Dashboard",
@@ -608,27 +690,27 @@ const L = {
     set: "Settings",
     users: "Users",
     logs: "Activity log",
-    xls: "Export Excel",
+    xls: "Download Report",
     add: "+ Transaction",
     net: "Net balance",
     ticket: "Seat sales",
     don: "Donations & investors",
+    incomeW: "Income",
     exp: "Expenses",
-    wait: "Awaiting bank check",
+    wait: "Unpaid",
     trend: "Income, last {n} days",
     seats: "Seat availability",
     left: "seats left",
     soldOf: "{a} sold of {b}",
-    queue: "Awaiting bank check",
-    noQueue: "Everything is verified.",
+    queue: "Unpaid",
+    noQueue: "Everything is paid off.",
     topBuy: "Top seat buyers",
     topDon: "Top donors & investors",
-    inRek: "Received",
+    inRek: "Paid",
     edit: "Edit",
     all: "All",
     unchecked: "Unchecked",
     seatsW: "Seats",
-    donW: "Donation",
     expW: "Expense",
     date: "Date",
     name: "Name",
@@ -639,22 +721,23 @@ const L = {
     newTx: "Record transaction",
     editTx: "Edit transaction",
     close: "Close",
-    tBuy: "Seat purchase",
-    tDon: "Donation / investor",
-    tExp: "Expense",
-    bankTo: "Receiving account",
-    bankFrom: "Paid from",
-    nameBuy: "Buyer name",
-    nameDon: "Donor / investor name",
+    paymentMethod: "Payment method",
+    bankNameLbl: "Bank",
+    nameGeneric: "Name",
     namePay: "Paid to",
+    tierLbl: "Type",
+    searchPlaceholder: "Search...",
     wa: "WhatsApp number",
-    catSeat: "Seat category",
-    catFree: "Free seat category",
+    txCat: "Category",
+    noCatYet: "No categories yet. Add one in Settings first.",
     nSeat: "Number of seats",
-    purpose: "Purpose",
     amtIn: "Transfer amount",
     amtOut: "Expense amount",
+    amtCash: "Cash amount",
+    amtCheque: "Cheque amount",
+    amtDebt: "Debt amount",
     note: "Transfer proof note",
+    note2: "Additional note",
     proof: "Transfer proof (image)",
     proofBig: "Image must be under 8 MB",
     proofHint: "Photos are automatically resized to save space",
@@ -664,8 +747,8 @@ const L = {
     viewProof: "View proof",
     searchTx: "Search name, phone, note, account...",
     status: "Payment status",
-    stW: "Awaiting bank check",
-    stV: "Received in account",
+    stW: "Unpaid",
+    stV: "Paid",
     save: "Save transaction",
     saveGeneric: "Save",
     del: "Delete",
@@ -683,23 +766,38 @@ const L = {
     methodCash: "Cash",
     methodCheque: "Cheque",
     methodOther: "Other",
+    methodDebt: "Debt",
     addMethod: "+ Add method",
-    cashBreakdown: "Cash denomination breakdown",
-    cashTotal: "Cash total",
     chequeNo: "Cheque no.",
     chequeBank: "Issuing bank",
     chequeDate: "Clearing date",
     saveSet: "Save settings",
     setSaved: "Settings saved",
-    catTitle: "Seat categories",
+    catTitle: "Transaction categories",
     price: "Price",
     quota: "Quota",
+    groupLbl: "Group",
+    qtyLbl: "Track qty",
+    tiersFor: "Price tiers: {n}",
+    tiersHint: "Add tiers/types with different prices (e.g. Platinum/Gold/Silver). Categories with tiers show a type picker on the transaction form.",
+    tierName: "Tier name",
+    addTier: "+ Add tier",
+    tiersBtn: "Tiers ({n})",
+    bonusRulesTitle: "Automatic bonus",
+    bonusRulesHint: "Example: sponsors giving at least Rp 20 million get 2 free Platinum seats. This is just a reminder on the transaction form - the free-seat transaction still needs to be recorded manually.",
+    bonusMinAmt: "Minimum amount",
+    bonusTargetCat: "Reward category",
+    bonusTargetTier: "Tier",
+    bonusQty: "Free quantity",
+    addBonusRule: "+ Add bonus rule",
+    bonusNeedsTiers: "Create a tiered category first (e.g. Seat Purchase) before adding a bonus rule.",
+    bonusHint: "Entitled to {qty} free {tier}-tier {cat}. Record it as a separate Rp 0 transaction.",
     addCat: "+ Add category",
     dataT: "Data",
     dataP: "Data is shared across everyone using this app.",
     clearAll: "Delete all transactions",
     cleared: "All transactions deleted",
-    imp: "Import data",
+    imp: "Upload Data",
     impDrop: "Choose an Excel or CSV file",
     impSub: "Use the template so columns are detected automatically",
     dlTpl: "Download template",
@@ -709,6 +807,13 @@ const L = {
     colName: "Column name in file",
     prev: "Import preview",
     rowsOk: "{n} rows ready to import",
+    txCount: "{n} transactions",
+    drillSearchPlaceholder: "Search name, category, amount, or status...",
+    txCountLbl: "transactions",
+    totalLbl: "total",
+    changeLbl: "Change",
+    dailyBalanceHint: "Cumulative daily balance, compared to the previous day.",
+    vsYesterday: "vs yesterday",
     rowsBad: "{n} rows skipped",
     doImp: "Import {n} rows",
     imported: "{n} transactions imported",
@@ -827,6 +932,31 @@ const L = {
     recorded: "Recorded",
     refresh: "Refresh",
     verified: "Verified",
+    dashboardTab: "Dashboard",
+    editDashboard: "Edit dashboard",
+    dashEditorHint: "Drag & resize widgets, then save the layout.",
+    addWidget: "+ Add widget",
+    saveLayout: "Save layout",
+    widgetType: "Widget type",
+    widgetTitleLbl: "Widget title",
+    metricLbl: "Value shown",
+    catFilterLbl: "Limit to categories",
+    catFilterHint: "Leave empty (none selected) to use every category in this group.",
+    wKpi: "Number card",
+    wChart: "Trend chart",
+    wPie: "Pie chart",
+    wTable: "Transaction table",
+    wBreakdown: "Category breakdown",
+    wQuota: "Quota / availability",
+    wQueue: "Pending queue",
+    wRank: "Leaderboard",
+    chartStyleLbl: "Chart style",
+    chartStyleBar: "Bar",
+    chartStyleLine: "Line",
+    allTypesLbl: "All",
+    ofTotal: "of total",
+    clickForDetail: "Click to view detail",
+    tableMoreHint: "+{n} more, open the Transactions tab to see all",
   },
 };
 const t = (k, v = {}) =>
@@ -842,39 +972,51 @@ const FL = {
   debit: { id: "Debit (Rp)", en: "Debit (Rp)" },
   credit: { id: "Kredit (Rp)", en: "Credit (Rp)" },
   amount: { id: "Nominal", en: "Amount" },
-  bank: { id: "Rekening", en: "Account" },
+  bank: { id: "Metode Pembayaran", en: "Payment Method" },
+  bankName: { id: "Bank", en: "Bank" },
   status: { id: "Status", en: "Status" },
   note: { id: "Catatan", en: "Note" },
+  note2: { id: "Keterangan Tambahan", en: "Additional Note" },
 };
 
 /* ================= hitung ================= */
 function sums(tx = S.tx, cats = D().cats) {
   const v = tx.filter((x) => x.status === "verified");
-  const inTicket = v
-    .filter((x) => x.type === "ticket")
-    .reduce((a, b) => a + b.amount, 0);
-  const inDon = v
-    .filter((x) => x.type === "donation")
+  const income = v
+    .filter((x) => x.type === "income")
     .reduce((a, b) => a + b.amount, 0);
   const exp = v
     .filter((x) => x.type === "expense")
     .reduce((a, b) => a + b.amount, 0);
+  // kuota/ketersediaan cuma berlaku utk kategori income yg "melacak jumlah"
+  // (dulu implisit = semua kategori tiket, sekarang eksplisit per kategori)
+  const qtyCatNames = cats
+    .filter((c) => c.group === "income" && c.hasQty)
+    .map((c) => c.n);
   const pd = tx.filter((x) => x.status === "pending" && x.type !== "expense");
-  const quota = cats.reduce((a, c) => a + (+c.q || 0), 0);
+  const quota = cats
+    .filter((c) => c.group === "income" && c.hasQty)
+    .reduce((a, c) => a + (+c.q || 0), 0);
   const sold = v
-    .filter((x) => x.type !== "expense")
+    .filter((x) => x.type === "income" && qtyCatNames.includes(x.cat))
     .reduce((a, b) => a + (+b.seats || 0), 0);
-  const held = pd.reduce((a, b) => a + (+b.seats || 0), 0);
+  const held = pd
+    .filter((x) => qtyCatNames.includes(x.cat))
+    .reduce((a, b) => a + (+b.seats || 0), 0);
+  const byCat = {};
+  v.forEach((x) => {
+    byCat[x.cat] = (byCat[x.cat] || 0) + x.amount;
+  });
   return {
-    inTicket,
-    inDon,
+    income,
     exp,
     quota,
     sold,
     held,
+    byCat,
     pendAmt: pd.reduce((a, b) => a + b.amount, 0),
     pendN: pd.length,
-    net: inTicket + inDon - exp,
+    net: income - exp,
     avail: Math.max(quota - sold - held, 0),
   };
 }
@@ -894,12 +1036,16 @@ function seriesByDay(d) {
   }
   return o;
 }
-function byPerson(ty, tx = S.tx) {
+// scope: undefined = semua income; array nama kategori = batasi ke kategori itu
+// (dipakai buat pisah papan peringkat "kategori bertipe qty" vs "bukan", lihat vBoard/pRank)
+function byPerson(scope, tx = S.tx) {
   const m = {};
   tx
     .filter(
       (x) =>
-        x.status === "verified" && (ty ? x.type === ty : x.type !== "expense"),
+        x.status === "verified" &&
+        x.type === "income" &&
+        (!scope || scope.includes(x.cat)),
     )
     .forEach((x) => {
       const k = (x.name || "—").trim();
@@ -938,12 +1084,68 @@ async function enterEvent(id) {
 // nama string) - ubah ke methods sekali saat acara itu pertama kali dibuka
 // lagi, lalu simpan supaya tidak perlu dikonversi ulang tiap kali
 async function normalizeEventConfig() {
-  if (S.config.methods) return;
-  const methods = methodsFromBanks(S.config.banks);
-  await mutateEvent(() => {
-    S.config.methods = methods;
-    delete S.config.banks;
-  }, null);
+  if (!S.config.methods) {
+    const methods = methodsFromBanks(S.config.banks);
+    await mutateEvent(() => {
+      S.config.methods = methods;
+      delete S.config.banks;
+    }, null);
+  }
+  if (needsCatMigration()) {
+    await mutateEvent(() => migrateCatsAndTypes(), null);
+  }
+}
+// v3.0: dulu kategori cuma tier kursi {n,p,q}, transaksi punya 3 tipe tetap
+// (ticket/donation - keduanya berbagi daftar kategori yg sama - dan expense,
+// yg kategorinya freetext "Keperluan"). Sekarang tiap kategori eksplisit
+// punya group (income/expense) + hasQty (melacak jumlah&harga satuan, atau
+// nominal manual), dan tipe transaksi cuma income/expense (ikut grup
+// kategori yg dipilih). Migrasi sekali per acara, idempoten - dicek lewat
+// bentuk data yg sudah ada, bukan version counter.
+function needsCatMigration() {
+  return (
+    (S.config.cats || []).some((c) => !c.group) ||
+    (S.tx || []).some((x) => x.type === "ticket" || x.type === "donation") ||
+    !S.config.dashboard
+  );
+}
+function migrateCatsAndTypes() {
+  S.config.cats.forEach((c) => {
+    if (!c.group) {
+      c.id = c.id || uid();
+      c.group = "income";
+      c.hasQty = true;
+    }
+  });
+  // baris expense lama nyimpan "Keperluan" bebas di x.cat - jadikan kategori
+  // expense baru per nilai unik, supaya datanya tetap tampil terkelompok
+  // dgn benar (admin bisa gabung/ganti nama lagi lewat Pengaturan)
+  const expNames = [
+    ...new Set(
+      S.tx
+        .filter((x) => x.type === "expense" && x.cat)
+        .map((x) => String(x.cat).trim())
+        .filter(Boolean),
+    ),
+  ];
+  expNames.forEach((n) => {
+    if (!S.config.cats.some((c) => c.group === "expense" && c.n === n)) {
+      S.config.cats.push({
+        id: uid(),
+        n,
+        group: "expense",
+        hasQty: false,
+        p: 0,
+        q: 0,
+      });
+    }
+  });
+  S.tx.forEach((x) => {
+    if (x.type === "ticket" || x.type === "donation") x.type = "income";
+  });
+  if (!S.config.dashboard) {
+    S.config.dashboard = { widgets: defaultDashboardWidgets(S.config.cats) };
+  }
 }
 // keputusan layar mana yang dibuka setelah login/impersonate/reload:
 // - acara tersimpan di sesi masih valid -> lanjutkan di situ
@@ -1034,7 +1236,14 @@ function render() {
       "--banner",
       (bannerEl ? bannerEl.offsetHeight : 0) + "px",
     );
-    if (tab === "dash") drawChart();
+    if (tab === "dash") {
+      drawChart();
+      drawPies();
+    } else if (tab === "admin" && adminTab === "dashboard") initDashGrid();
+    else if (dashGrid) {
+      dashGrid.destroy(false);
+      dashGrid = null;
+    }
   }
 }
 function langSeg() {
@@ -1583,6 +1792,19 @@ function vHubMonitor() {
 function vApp() {
   const s = sums(),
     a = acting();
+  const hasQtyCats = D().cats.some((c) => c.group === "income" && c.hasQty);
+  const headerSub = [
+    D().date
+      ? new Date(D().date + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", {
+          day: "numeric",
+          month: "short",
+          year: "numeric",
+        })
+      : "",
+    hasQtyCats ? s.sold + " " + t("seatsSold") : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const tabs = [
     ["dash", t("dash")],
     ["tx", t("tx")],
@@ -1599,7 +1821,7 @@ function vApp() {
   <header><div class="wrap">
     <div class="mark">TS</div>
     <div style="flex:1;min-width:0"><h1 style="font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(D().event || "Konser")}</h1>
-      <div class="sub">${(D().date ? new Date(D().date + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", { day: "numeric", month: "short", year: "numeric" }) + " · " : "") + s.sold + " " + t("seatsSold")}</div></div>
+      <div class="sub">${esc(headerSub)}</div></div>
     ${themeBtn()}
     ${langSeg()}
     <button class="btn ghost sm xls-btn" onclick="openExportPeriod()">${downloadIcon}<span class="xls-label">${t("xls")}</span></button>
@@ -1611,6 +1833,11 @@ function vApp() {
 }
 function go(k) {
   tab = k;
+  render();
+}
+function goDashEditor() {
+  tab = "admin";
+  adminTab = "dashboard";
   render();
 }
 function setAuthMode(f) {
@@ -1700,13 +1927,12 @@ function openMe() {
     }
     ${
       events.length
-        ? `<div class="field" style="margin-top:14px"><label>${t("switchEvent")}</label>
-      ${events
-        .map(
-          (e) =>
-            `<button class="btn ghost wide" style="display:flex;justify-content:flex-start;text-align:left;margin-bottom:6px" onclick="switchEvent('${e.id}')">${esc(e.name)}</button>`,
-        )
-        .join("")}</div>`
+        ? `<div class="field" style="margin-top:14px">
+      <label>${t("switchEvent")}</label>
+      <select id="f_switchEvent" onchange="this.value && switchEvent(this.value)">
+        <option value="" selected disabled>${t("chooseEvent")}</option>
+        ${events.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`).join("")}
+      </select></div>`
         : ""
     }
     ${
@@ -1715,6 +1941,7 @@ function openMe() {
         : ""
     }
     <button class="btn danger wide" style="margin-top:14px" onclick="closeSheet();doSignOut()">${t("signOut")}</button>`);
+  if (events.length) initCombobox("f_switchEvent", t("chooseEvent"));
 }
 async function stopImp() {
   const n = imp.name;
@@ -1725,142 +1952,845 @@ async function stopImp() {
   toast(t("backAdmin") + " · " + n);
 }
 
-/* ================= dashboard ================= */
-function pSeats() {
-  const s = sums(),
-    pct = s.quota ? Math.round((s.sold / s.quota) * 100) : 0;
-  return `<span class="label">${t("seats")}</span>
-  <div class="mono" style="font-size:29px;font-weight:700;letter-spacing:-.035em">${s.avail}<span style="font-size:15px;color:var(--tx2);font-weight:500"> ${t("left")}</span></div>
-  <div class="bar"><i style="width:${Math.min(pct, 100)}%"></i></div>
-  <div class="rowsp hint" style="flex:none"><span>${t("soldOf", { a: s.sold, b: s.quota })}</span><span>${pct}%</span></div>
-  <div class="scroll" style="margin-top:6px">${D()
-    .cats.map((c) => {
-      const sd = S.tx
-        .filter((x) => x.status === "verified" && x.cat === c.n)
-        .reduce((a, b) => a + (+b.seats || 0), 0);
-      return `<div class="rowsp" style="padding:7px 0;border-top:1px solid var(--line2);font-size:15px">
-      <span>${esc(c.n)} <span class="hint">${rp(c.p)}</span></span><span class="mono" style="font-weight:600">${sd}/${c.q}</span></div>`;
-    })
-    .join("")}</div>`;
+/* ================= dashboard (widget) ================= */
+// grid dashboard: tiap widget punya posisi/ukuran (x,y,w,h) dalam satuan
+// grid CSS 12-kolom. Mode lihat (di sini) murni CSS grid, tanpa lib apa pun -
+// editor drag/resize-nya (gridstack, admin-only) baru dimuat lazy di tab
+// terpisah, lihat vDashEditor()/goDashEditor().
+const DASHBOARD_COLS = 12;
+const DASHBOARD_ROW_H = 80;
+const PIE_COLORS = [
+  "--chart-1", "--chart-2", "--chart-3", "--chart-4",
+  "--chart-5", "--chart-6", "--chart-7", "--chart-8",
+];
+// tampilkan label persentase langsung di tiap slice (bukan cuma pas hover) -
+// posisinya diambil dari getCenterPoint() bawaan ArcElement Chart.js, jadi
+// otomatis benar utk pie maupun doughnut, apa pun ukuran cutout-nya
+const pieLabelsPlugin = {
+  id: "pieLabels",
+  afterDatasetsDraw(chart) {
+    const { ctx } = chart;
+    chart.data.datasets.forEach((dataset, di) => {
+      const meta = chart.getDatasetMeta(di);
+      if (meta.hidden) return;
+      const total = dataset.data.reduce((a, b) => a + b, 0);
+      if (!total) return;
+      meta.data.forEach((arc, i) => {
+        const v = dataset.data[i];
+        const pct = Math.round((v / total) * 100);
+        if (!v || pct < 4) return; // slice terlalu tipis, label akan tumpang tindih
+        const pos = arc.getCenterPoint();
+        ctx.save();
+        ctx.fillStyle = "#fff";
+        ctx.font = "700 12px Inter, system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.shadowColor = "rgba(0,0,0,.45)";
+        ctx.shadowBlur = 4;
+        ctx.fillText(pct + "%", pos.x, pos.y);
+        ctx.restore();
+      });
+    });
+  },
+};
+// judul widget default (dibuat via t() saat migrasi/starter/tambah widget)
+// disimpan sbg teks statis di config.dashboard.widgets - kalau bahasa
+// diganti belakangan, teks yg SUDAH TERSIMPAN itu tidak otomatis berubah.
+// Supaya konsisten, kalau judul yg tersimpan masih persis sama dgn salah
+// satu versi bahasa aslinya (belum diedit manual oleh admin jadi judul
+// custom), tampilkan terjemahan LIVE-nya saja, bukan teks beku itu.
+const WIDGET_TITLE_KEYS = [
+  "net", "incomeW", "exp", "wait", "seats", "queue", "topBuy", "topDon", "rank",
+  "wKpi", "wChart", "wPie", "wTable", "wBreakdown", "wQuota", "wQueue", "wRank",
+];
+function liveTitle(storedTitle) {
+  for (const key of WIDGET_TITLE_KEYS) {
+    if (storedTitle === L.id[key] || storedTitle === L.en[key]) return t(key);
+  }
+  return storedTitle;
 }
-function pQueue() {
-  const s = sums(),
-    q = S.tx.filter((x) => x.status === "pending");
-  return `<div class="rowsp" style="flex:none"><span class="label">${t("queue")}</span>
-    <span class="mono amb" style="font-weight:700;font-size:17px">${rpk(s.pendAmt)}</span></div>
-  <div class="scroll" style="flex:1;margin-top:4px">${
-    q
-      .map(
-        (
-          x,
-        ) => `<div class="rowsp" style="padding:7px 0;border-top:1px solid var(--line2)">
-    <div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.name)}</div>
-    <div class="hint mono">${rpk(x.amount)} · ${esc(x.bank || "-")}</div></div>
-    <button class="btn ok sm" onclick="verify('${x.id}')">${t("inRek")}</button></div>`,
-      )
-      .join("") ||
-    `<div class="hint" style="padding-top:10px">${t("noQueue")}</div>`
+const widgetTitle = (w) => `<span class="label">${esc(liveTitle(w.title))}</span>`;
+function widgetCatsInGroup(w) {
+  // group tak diisi (dipakai widget "table" generik) -> semua kategori
+  const all = w.group ? D().cats.filter((c) => c.group === w.group) : D().cats;
+  return w.catIds && w.catIds.length ? all.filter((c) => w.catIds.includes(c.id)) : all;
+}
+function widgetKpiValue(w, s) {
+  if (w.metric === "net") return s.net;
+  if (w.metric === "income") return s.income;
+  if (w.metric === "expense") return s.exp;
+  if (w.metric === "pendingAmt") return s.pendAmt;
+  if (typeof w.metric === "string" && w.metric.startsWith("cat:")) {
+    const c = D().cats.find((x) => x.id === w.metric.slice(4));
+    return c ? s.byCat[c.n] || 0 : 0;
+  }
+  return 0;
+}
+
+/* ----- drill-down: klik kartu/baris/titik grafik -> pop up daftar transaksinya ----- */
+const DRILL_PAGE_SIZE = 8;
+let drillState = null;
+function drillMatches(x, q) {
+  if (!q) return true;
+  const hay = [x.name, catLabel(x), rp(x.amount), String(x.amount), x.status === "verified" ? t("inRek") : t("stW"), x.note]
+    .join(" ")
+    .toLowerCase();
+  return q
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .every((term) => hay.includes(term));
+}
+function drillRowHtml(x) {
+  const isExp = x.type === "expense";
+  return `<div class="drill-row drill" onclick="closeSheet();openTx('${x.id}')">
+    <div class="drill-row-bar ${isExp ? "drill-bar-neg" : "drill-bar-pos"}"></div>
+    <div style="flex:1;min-width:0;display:flex;justify-content:space-between;gap:10px;align-items:flex-start">
+      <div style="min-width:0">
+        <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</div>
+        <div class="hint" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(catLabel(x))} · ${x.date.slice(8)}/${x.date.slice(5, 7)}/${x.date.slice(0, 4)}</div>
+      </div>
+      <div style="text-align:right;flex:none">
+        <div class="mono" style="font-weight:700${isExp ? ";color:var(--red)" : ""}">${isExp ? "−" : ""}${rp(x.amount)}</div>
+        <span class="tag ${x.status === "verified" ? "t-ok" : "t-wait"}" style="margin-top:3px;display:inline-block">${x.status === "verified" ? t("inRek") : t("stW")}</span>
+      </div>
+    </div>
+  </div>`;
+}
+function renderDrillBody() {
+  const filtered = drillState.txList
+    .filter((x) => drillMatches(x, drillState.q))
+    .slice()
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const { items, page, totalPages } = paginate(filtered, drillState.page, DRILL_PAGE_SIZE);
+  drillState.page = page;
+  const total = filtered.reduce((a, x) => a + (x.type === "expense" ? -x.amount : x.amount), 0);
+  const statsEl = document.getElementById("drillStats");
+  if (statsEl)
+    statsEl.innerHTML = `
+    <div class="drill-stat"><b>${filtered.length}</b><span class="hint">${t("txCountLbl")}</span></div>
+    <div class="drill-stat"><b class="mono">${rp(total)}</b><span class="hint">${t("totalLbl")}</span></div>`;
+  const bodyEl = document.getElementById("drillBody");
+  if (bodyEl)
+    bodyEl.innerHTML = items.length
+      ? items.map(drillRowHtml).join("") + pagerHtml(page, totalPages, "setDrillPage")
+      : `<div class="empty">${t("noneYet")}</div>`;
+}
+function onDrillSearch(v) {
+  drillState.q = v;
+  drillState.page = 1;
+  renderDrillBody();
+}
+function setDrillPage(p) {
+  drillState.page = p;
+  renderDrillBody();
+}
+function openTxListSheet(title, txList) {
+  drillState = { title, txList, q: "", page: 1 };
+  sheet(`<div class="rowsp" style="margin-bottom:10px"><h2 style="font-size:19px">${esc(title)}</h2>${closeBtn()}</div>
+    <div class="drill-stats" id="drillStats"></div>
+    <input id="drillSearch" placeholder="${t("drillSearchPlaceholder")}" style="margin-bottom:12px" oninput="onDrillSearch(this.value)">
+    <div id="drillBody" style="max-height:56vh;overflow-y:auto;padding-bottom:8px"></div>`);
+  renderDrillBody();
+}
+// "Saldo bersih" tidak masuk akal ditampilkan sbg daftar transaksi datar -
+// yg berguna adalah saldo KUMULATIF per hari (H vs H-1) beserta persentase
+// naik/turunnya, jadi widget ini dapat tampilan drill-down sendiri
+function balanceAsOf(dateStr) {
+  return S.tx
+    .filter((x) => x.status === "verified" && x.date <= dateStr)
+    .reduce((a, x) => a + (x.type === "expense" ? -x.amount : x.amount), 0);
+}
+function drilldownNet() {
+  const N = 14;
+  const days = [];
+  for (let i = N - 1; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    days.push(d.toISOString().slice(0, 10));
+  }
+  const bal = days.map(balanceAsOf);
+  const rows = days
+    .map((d, i) => {
+      const prev = i > 0 ? bal[i - 1] : null;
+      const delta = prev !== null ? bal[i] - prev : null;
+      const pct = prev ? (delta / Math.abs(prev)) * 100 : delta && delta !== 0 ? 100 : 0;
+      return { date: d, balance: bal[i], delta, pct };
+    })
+    .reverse();
+  sheet(`<div class="rowsp" style="margin-bottom:4px"><h2 style="font-size:19px">${t("net")}</h2>${closeBtn()}</div>
+    <p class="hint" style="margin:0 0 12px">${t("dailyBalanceHint")}</p>
+    <div style="overflow-x:auto;max-height:65vh;overflow-y:auto"><table><thead><tr>
+      <th>${t("date")}</th><th style="text-align:right">${t("net")}</th><th style="text-align:right">${t("changeLbl")}</th></tr></thead><tbody>
+    ${rows
+      .map((r) => {
+        const flat = r.delta === 0;
+        const up = r.delta === null || flat ? null : r.delta >= 0;
+        const arrow = up === null ? "" : up ? trendUpIcon : trendDownIcon;
+        const cls = up === null ? "hint" : up ? "pos" : "neg";
+        const dt = new Date(r.date + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", {
+          day: "2-digit",
+          month: "short",
+        });
+        const changeText = r.delta === null ? "—" : flat ? "0.0%" : `${r.pct >= 0 ? "+" : ""}${r.pct.toFixed(1)}%`;
+        return `<tr><td class="mono hint">${dt}</td>
+        <td class="mono" style="text-align:right;font-weight:600">${rp(r.balance)}</td>
+        <td class="${cls}" style="text-align:right;white-space:nowrap"><span style="display:inline-flex;align-items:center;gap:4px;justify-content:flex-end">${arrow}${changeText}</span></td></tr>`;
+      })
+      .join("")}
+    </tbody></table></div>`);
+}
+function txForCat(catName, verifiedOnly = true) {
+  return S.tx.filter((x) => x.cat === catName && (!verifiedOnly || x.status === "verified"));
+}
+function txForPerson(name, catNames) {
+  return S.tx.filter(
+    (x) =>
+      x.status === "verified" &&
+      x.type === "income" &&
+      x.name === name &&
+      (!catNames || !catNames.length || catNames.includes(x.cat)),
+  );
+}
+function txForDate(dateStr) {
+  return S.tx.filter((x) => x.date === dateStr && x.status === "verified" && x.type === "income");
+}
+function txForKpi(w) {
+  if (w.metric === "income") return S.tx.filter((x) => x.status === "verified" && x.type === "income");
+  if (w.metric === "expense") return S.tx.filter((x) => x.status === "verified" && x.type === "expense");
+  if (w.metric === "net") return S.tx.filter((x) => x.status === "verified");
+  if (w.metric === "pendingAmt") return S.tx.filter((x) => x.status === "pending");
+  if (typeof w.metric === "string" && w.metric.startsWith("cat:")) {
+    const c = D().cats.find((x) => x.id === w.metric.slice(4));
+    return c ? txForCat(c.n) : [];
+  }
+  return [];
+}
+function findWidget(id) {
+  return (S.config.dashboard?.widgets || []).find((w) => w.id === id);
+}
+function drilldownKpi(widgetId) {
+  const w = findWidget(widgetId);
+  if (!w) return;
+  if (w.metric === "net") return drilldownNet();
+  openTxListSheet(liveTitle(w.title), txForKpi(w));
+}
+function drilldownCat(catName) {
+  openTxListSheet(catName, txForCat(catName, false));
+}
+function drilldownPerson(name, widgetId) {
+  const w = findWidget(widgetId);
+  openTxListSheet(name, txForPerson(name, w ? widgetCatsInGroup(w).map((c) => c.n) : null));
+}
+function drilldownDate(dateStr) {
+  openTxListSheet(
+    new Date(dateStr + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    }),
+    txForDate(dateStr),
+  );
+}
+
+// bandingkan nilai KUMULATIF per metrik hari ini vs kemarin (H vs H-1) -
+// "pendingAmt" dilewati krn belum lunas bukan konsep yg akumulatif dari waktu
+function widgetKpiTrend(w) {
+  if (w.metric === "pendingAmt") return null;
+  const yesterday = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  })();
+  const valueAsOf = (dateStr) => {
+    const tx = S.tx.filter((x) => x.status === "verified" && x.date <= dateStr);
+    if (w.metric === "income") return tx.filter((x) => x.type === "income").reduce((a, b) => a + b.amount, 0);
+    if (w.metric === "expense") return tx.filter((x) => x.type === "expense").reduce((a, b) => a + b.amount, 0);
+    if (w.metric === "net") return tx.reduce((a, x) => a + (x.type === "expense" ? -x.amount : x.amount), 0);
+    if (typeof w.metric === "string" && w.metric.startsWith("cat:")) {
+      const c = D().cats.find((x) => x.id === w.metric.slice(4));
+      return c ? tx.filter((x) => x.cat === c.n).reduce((a, b) => a + b.amount, 0) : null;
+    }
+    return null;
+  };
+  const vToday = valueAsOf(today()),
+    vYesterday = valueAsOf(yesterday);
+  if (vToday === null || vYesterday === null) return null;
+  const delta = vToday - vYesterday;
+  if (!delta) return { delta: 0, pct: 0, up: true, flat: true };
+  const pct = vYesterday !== 0 ? (delta / Math.abs(vYesterday)) * 100 : 100;
+  return { delta, pct, up: delta >= 0, flat: false };
+}
+function renderKpiWidget(w, s) {
+  const val = widgetKpiValue(w, s);
+  const cls =
+    w.metric === "expense" ? "neg" : w.metric === "net" ? (val >= 0 ? "pos" : "neg") : "blu";
+  const trend = widgetKpiTrend(w);
+  // warna badge tren selalu ikut arah matematisnya (naik=hijau, turun=merah)
+  // - tidak dibalik utk "pengeluaran naik = buruk", biar konsisten & tidak
+  // membingungkan (naik selalu hijau, apa pun metriknya)
+  const trendHtml = trend
+    ? `<div class="kpi-trend ${trend.flat ? "flat" : trend.up ? "pos" : "neg"}" title="${t("vsYesterday")}">${trend.flat ? "" : trend.up ? trendUpIcon : trendDownIcon}<span>${trend.flat ? "0%" : `${trend.pct >= 0 ? "+" : ""}${trend.pct.toFixed(1)}%`}</span></div>`
+    : "";
+  return `<div class="rowsp" style="align-items:flex-start;flex:none;flex-wrap:wrap;row-gap:4px"><div style="min-width:0"><div class="label">${esc(liveTitle(w.title))}</div><div class="n mono ${cls}">${rpk(val)}</div></div>${trendHtml}</div>`;
+}
+function renderChartWidget(w) {
+  return `<div class="rowsp" style="flex:none">${widgetTitle(w)}
+    <span class="mono" style="font-weight:700;font-size:17px">${rpk(sums().income)}</span></div>
+    <div class="chartbox"><canvas id="wchart_${w.id}" data-chart-widget="${w.id}"></canvas></div>`;
+}
+function renderPieWidget(w) {
+  return `${widgetTitle(w)}<div class="chartbox"><canvas id="wpie_${w.id}" data-pie-widget="${w.id}"></canvas></div>`;
+}
+function renderTableWidget(w) {
+  const catNames = widgetCatsInGroup(w).map((c) => c.n);
+  const all = S.tx
+    .filter((x) => catNames.includes(x.cat))
+    .slice()
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const rows = all.slice(0, 30);
+  return `${widgetTitle(w)}<div class="scroll" style="flex:1;margin-top:4px"><table style="font-size:13px"><thead><tr>
+    <th>${t("date")}</th><th>${t("name")}</th><th style="text-align:right">${t("amount")}</th></tr></thead><tbody>
+    ${
+      rows
+        .map(
+          (x) => `<tr class="drill" onclick="openTx('${x.id}')" title="${esc(catLabel(x))} · ${x.status === "verified" ? t("inRek") : t("stW")}">
+      <td class="mono hint" style="white-space:nowrap">${x.date.slice(8)}/${x.date.slice(5, 7)}</td>
+      <td style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px">${esc(x.name)}</td>
+      <td class="mono ${x.type === "expense" ? "neg" : ""}" style="text-align:right;white-space:nowrap">${x.type === "expense" ? "−" : ""}${rp(x.amount)}</td></tr>`,
+        )
+        .join("") || `<tr><td colspan="3" class="empty">${t("noneYet")}</td></tr>`
+    }
+    </tbody></table>${all.length > 30 ? `<div class="hint" style="text-align:center;padding-top:6px">${t("tableMoreHint", { n: all.length - 30 })}</div>` : ""}</div>`;
+}
+function renderBreakdownWidget(w, s) {
+  const cats = widgetCatsInGroup(w)
+    .slice()
+    .sort((a, b) => (s.byCat[b.n] || 0) - (s.byCat[a.n] || 0));
+  const total = cats.reduce((a, c) => a + (s.byCat[c.n] || 0), 0);
+  return `${widgetTitle(w)}<div class="scroll" style="flex:1;margin-top:4px">${
+    cats
+      .map((c) => {
+        const v = s.byCat[c.n] || 0,
+          pct = total ? Math.round((v / total) * 100) : 0;
+        return `<div class="rowsp drill" style="padding:6px 0;border-top:1px solid var(--line2);font-size:15px" onclick="drilldownCat('${esc(c.n)}')" title="${pct}% ${t("ofTotal")} · ${rp(v)}">
+      <span>${esc(c.n)}</span><span class="mono" style="font-weight:600">${rp(v)}</span></div>`;
+      })
+      .join("") || `<div class="hint" style="padding-top:10px">${t("noneYet")}</div>`
   }</div>`;
 }
-function pRank() {
-  const a = byPerson("ticket").slice(0, 5),
-    b = byPerson("donation").slice(0, 5);
-  const row = (x, i) =>
-    `<div class="rowsp" style="padding:5px 0;font-size:15px"><span style="min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${i + 1}. ${esc(x.name)}</span><span class="mono" style="font-weight:600">${rpk(x.amount)}</span></div>`;
-  return `<span class="label">${t("topBuy")}</span><div style="margin-bottom:8px">${a.map(row).join("") || `<div class="hint">${t("noneYet")}</div>`}</div>
-  <span class="label">${t("topDon")}</span><div class="scroll">${b.map(row).join("") || `<div class="hint">${t("noneYet")}</div>`}</div>`;
+function renderQuotaWidget(w) {
+  const cats = D().cats.filter(
+    (c) => c.group === "income" && c.hasQty && (!w.catIds?.length || w.catIds.includes(c.id)),
+  );
+  const quota = cats.reduce((a, c) => a + (+c.q || 0), 0);
+  const soldOf = (c) =>
+    S.tx
+      .filter((x) => x.status === "verified" && x.cat === c.n)
+      .reduce((a, b) => a + (+b.seats || 0), 0);
+  const sold = cats.reduce((a, c) => a + soldOf(c), 0);
+  const pct = quota ? Math.round((sold / quota) * 100) : 0;
+  return `${widgetTitle(w)}
+  <div class="mono" style="font-size:26px;font-weight:700;letter-spacing:-.03em;margin-top:4px">${Math.max(quota - sold, 0)}<span style="font-size:13px;color:var(--tx2);font-weight:500"> ${t("left")}</span></div>
+  <div class="bar"><i style="width:${Math.min(pct, 100)}%"></i></div>
+  <div class="rowsp hint" style="flex:none"><span>${t("soldOf", { a: sold, b: quota })}</span><span>${pct}%</span></div>
+  <div class="scroll" style="margin-top:6px;flex:1">${
+    cats
+      .map((c) => {
+        const sd = soldOf(c),
+          v = rp((D().cats.find((x) => x.n === c.n) || {}).p * sd || 0);
+        return `<div class="rowsp drill" style="padding:6px 0;border-top:1px solid var(--line2);font-size:14px" onclick="drilldownCat('${esc(c.n)}')" title="${t("txCat")}: ${esc(c.n)} · ${v}">
+      <span>${esc(c.n)}</span><span class="mono" style="font-weight:600">${sd}/${c.q || "∞"}</span></div>`;
+      })
+      .join("") || `<div class="hint" style="padding-top:10px">${t("noneYet")}</div>`
+  }</div>`;
+}
+function renderQueueWidget(w) {
+  const q = S.tx.filter((x) => x.status === "pending");
+  return `${widgetTitle(w)}<div class="scroll" style="flex:1;margin-top:4px">${
+    q
+      .map(
+        (x) => `<div class="rowsp drill" style="padding:7px 0;border-top:1px solid var(--line2)" onclick="openTx('${x.id}')">
+    <div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.name)}</div>
+    <div class="hint mono">${rpk(x.amount)} · ${esc(x.bank || "-")}</div></div>
+    <button class="btn ok sm" onclick="event.stopPropagation();verify('${x.id}')">${t("inRek")}</button></div>`,
+      )
+      .join("") || `<div class="hint" style="padding-top:10px">${t("noQueue")}</div>`
+  }</div>`;
+}
+const MEDAL_COLORS = ["#e8b923", "#a9adb4", "#c4813f"];
+function renderRankWidget(w) {
+  const names = widgetCatsInGroup(w).map((c) => c.n);
+  const rows = byPerson(names).slice(0, 8);
+  const max = rows.reduce((m, x) => Math.max(m, x.amount), 0) || 1;
+  return `${widgetTitle(w)}<div class="scroll" style="flex:1;margin-top:8px">${
+    rows
+      .map((x, i) => {
+        const pct = Math.max(6, Math.round((x.amount / max) * 100));
+        const medal = i < 3 ? MEDAL_COLORS[i] : null;
+        const detail = `${x.n} ${t("trans")}${x.seats ? " · " + x.seats + " " + t("seatsW").toLowerCase() : ""}`;
+        return `<div class="rank-row drill" onclick="drilldownPerson('${esc(x.name).replace(/'/g, "&#39;")}','${w.id}')" title="${detail} · ${rp(x.amount)}">
+      <div class="rank-badge" style="${medal ? `background:${medal};color:#fff` : "background:var(--line2);color:var(--tx2)"}">${i + 1}</div>
+      <div style="flex:1;min-width:0">
+        <div class="rowsp" style="gap:8px"><span class="rank-name">${esc(x.name)}</span><span class="mono rank-amt">${rpk(x.amount)}</span></div>
+        <div class="rank-bar"><i style="width:${pct}%;background:${medal || "var(--blue)"}"></i></div>
+      </div></div>`;
+      })
+      .join("") || `<div class="hint">${t("noneYet")}</div>`
+  }</div>`;
+}
+function widgetContent(w, s) {
+  switch (w.type) {
+    case "kpi":
+      return renderKpiWidget(w, s);
+    case "chart":
+      return renderChartWidget(w);
+    case "pie":
+      return renderPieWidget(w);
+    case "table":
+      return renderTableWidget(w);
+    case "breakdown":
+      return renderBreakdownWidget(w, s);
+    case "quota":
+      return renderQuotaWidget(w);
+    case "queue":
+      return renderQueueWidget(w);
+    case "rank":
+      return renderRankWidget(w);
+    default:
+      return "";
+  }
+}
+// layout default dipakai migrasi acara lama (v3.0) - mereproduksi tampilan
+// dashboard tetap yg ada sebelumnya (KPI+tren+kuota+antrian+peringkat)
+function defaultDashboardWidgets(cats) {
+  // dulu pRank()/vBoard() selalu menampilkan 2 papan terpisah (pembeli
+  // qty-tracked vs donatur non-qty) - pertahankan itu sbg 2 widget rank
+  // yg masing2 dibatasi catIds-nya, bukan digabung jadi 1 daftar. catIds
+  // kosong berarti "semua kategori di grup ini" di editor manual (lihat
+  // widgetCatsInGroup), jadi kalau salah satu sisi (qty/flat) memang tidak
+  // punya kategori sama sekali, widget itu dilewati saja - bukan dibikin
+  // dengan catIds:[] yang malah kebaca "semua" dan jadi duplikat isinya.
+  const qtyIds = cats.filter((c) => c.group === "income" && c.hasQty).map((c) => c.id);
+  const flatIds = cats.filter((c) => c.group === "income" && !c.hasQty).map((c) => c.id);
+  const widgets = [
+    { id: uid(), type: "kpi", title: t("net"), metric: "net", x: 0, y: 0, w: 3, h: 1 },
+    { id: uid(), type: "kpi", title: t("incomeW"), metric: "income", x: 3, y: 0, w: 3, h: 1 },
+    { id: uid(), type: "kpi", title: t("exp"), metric: "expense", x: 6, y: 0, w: 3, h: 1 },
+    { id: uid(), type: "kpi", title: t("wait"), metric: "pendingAmt", x: 9, y: 0, w: 3, h: 1 },
+    { id: uid(), type: "chart", title: t("trend", { n: 14 }), x: 0, y: 1, w: 6, h: 4 },
+    { id: uid(), type: "quota", title: t("seats"), catIds: [], x: 6, y: 1, w: 3, h: 4 },
+    { id: uid(), type: "queue", title: t("queue"), catIds: [], x: 9, y: 1, w: 3, h: 4 },
+  ];
+  const rankW = qtyIds.length && flatIds.length ? 6 : 12;
+  if (qtyIds.length)
+    widgets.push({ id: uid(), type: "rank", title: t("topBuy"), group: "income", catIds: qtyIds, x: 0, y: 5, w: rankW, h: 3 });
+  if (flatIds.length)
+    widgets.push({
+      id: uid(),
+      type: "rank",
+      title: t("topDon"),
+      group: "income",
+      catIds: flatIds,
+      x: qtyIds.length ? 6 : 0,
+      y: 5,
+      w: rankW,
+      h: 3,
+    });
+  return widgets;
+}
+// layout awal acara baru - cuma 3 KPI dasar, admin melengkapi sisanya lewat
+// editor dashboard (Admin > Dashboard) setelah kategori acaranya didefinisikan
+function starterDashboardWidgets() {
+  return [
+    { id: uid(), type: "kpi", title: t("incomeW"), metric: "income", x: 0, y: 0, w: 4, h: 1 },
+    { id: uid(), type: "kpi", title: t("exp"), metric: "expense", x: 4, y: 0, w: 4, h: 1 },
+    { id: uid(), type: "kpi", title: t("net"), metric: "net", x: 8, y: 0, w: 4, h: 1 },
+  ];
 }
 function vDash() {
   const s = sums(),
     nw = narrow();
-  const k = (l, v, c) =>
-    `<div class="card kpi act" style="padding:11px 13px;justify-content:center"><div class="label">${l}</div><div class="n mono ${c || ""}">${v}</div></div>`;
-  const kpis =
-    k(t("net"), rpk(s.net), s.net >= 0 ? "pos" : "neg") +
-    k(t("ticket"), rpk(s.inTicket), "blu") +
-    k(t("don"), rpk(s.inDon)) +
-    k(t("exp"), rpk(s.exp), "neg") +
-    (nw ? "" : k(t("wait"), rpk(s.pendAmt), "amb"));
-  const chart = `<div class="card" style="grid-row:span ${nw ? 1 : 2}">
-      <div class="rowsp" style="flex:none"><span class="label">${t("trend", { n: nw ? 7 : 14 })}</span>
-      <span class="mono" style="font-weight:700;font-size:17px">${rpk(s.inTicket + s.inDon)}</span></div>
-      <div class="chartbox"><canvas id="c1"></canvas></div></div>`;
-  if (nw)
+  const widgets = D().dashboard?.widgets || [];
+  if (!widgets.length)
+    return `<div class="fit" style="align-items:center;justify-content:center;text-align:center">
+      <div class="empty">${t("noneYet")}${isAdmin() ? `<br><button class="btn sm" style="margin-top:10px" onclick="goDashEditor()">${t("editDashboard")}</button>` : ""}</div></div>`;
+  const kpiWidgets = widgets.filter((w) => w.type === "kpi");
+  const chartWidget = widgets.find((w) => w.type === "chart");
+  const otherWidgets = widgets.filter((w) => w.type !== "kpi" && w.type !== "chart");
+  if (nw) {
+    const activeId = otherWidgets.some((w) => w.id === panel) ? panel : otherWidgets[0]?.id;
+    const active = otherWidgets.find((w) => w.id === activeId);
     return `<div class="fit">
-    <div class="grid" style="grid-template-columns:1fr 1fr;flex:none">${kpis}</div>${chart}
-    <div class="card" style="flex:1.1;gap:6px">
-      <div class="seg" style="align-self:flex-start;flex:none">${[
-        ["seats", t("seatsW")],
-        ["queue", t("queue")],
-        ["rank", t("rank")],
-      ]
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(100px,1fr));flex:none">${kpiWidgets
+      .map(
+        (w) =>
+          `<div class="card kpi act drill" style="padding:11px 13px;justify-content:center" onclick="drilldownKpi('${w.id}')">${renderKpiWidget(w, s)}</div>`,
+      )
+      .join("")}</div>
+    ${chartWidget ? `<div class="card">${renderChartWidget(chartWidget)}</div>` : ""}
+    ${
+      otherWidgets.length
+        ? `<div class="card" style="flex:1.1;gap:6px">
+      <div class="seg" style="align-self:stretch;flex:none;max-width:100%">${otherWidgets
         .map(
-          ([p, l]) =>
-            `<button class="${panel === p ? "on" : ""}" onclick="setPanel('${p}')">${l}</button>`,
+          (w) =>
+            `<button class="${activeId === w.id ? "on" : ""}" onclick="setPanel('${w.id}')">${esc(liveTitle(w.title))}</button>`,
         )
         .join("")}</div>
-      <div style="display:flex;flex-direction:column;flex:1;min-height:0">${{ seats: pSeats, queue: pQueue, rank: pRank }[panel]()}</div>
-    </div></div>`;
-  return `<div class="fit">
-    <div class="grid" style="grid-template-columns:repeat(5,1fr);flex:none">${kpis}</div>
-    <div class="grid" style="grid-template-columns:1.45fr 1fr 1fr;grid-template-rows:1fr 1fr;flex:1;min-height:0">
-      ${chart}<div class="card">${pSeats()}</div><div class="card">${pQueue()}</div>
-      <div class="card" style="grid-column:span 2">${pRank()}</div></div></div>`;
+      <div style="display:flex;flex-direction:column;flex:1;min-height:0">${active ? widgetContent(active, s) : ""}</div>
+    </div>`
+        : ""
+    }</div>`;
+  }
+  // sengaja BUKAN .fit (tinggi terbatas + scroll internal) - .fit ada di
+  // dalam .wrap yg lebarnya dibatasi max-width & di-tengah-kan, jadi area
+  // kosong di kiri/kanan layar lebar tidak akan pernah memicu scroll-nya.
+  // Di sini dashboard mengalir sebagai konten halaman biasa supaya scroll
+  // (mouse wheel/trackpad) bekerja di mana pun kursor berada di layar.
+  return `<div style="padding:10px 0 100px">
+    <div class="grid" style="grid-template-columns:repeat(${DASHBOARD_COLS},1fr);grid-auto-rows:${DASHBOARD_ROW_H}px;gap:12px">
+      ${widgets
+        .map((w) => {
+          const kpi = w.type === "kpi";
+          return `<div class="card${kpi ? " kpi act drill" : ""}" style="grid-column:${w.x + 1} / span ${Math.min(w.w, DASHBOARD_COLS)};grid-row:${w.y + 1} / span ${w.h};overflow:hidden;display:flex;flex-direction:column${kpi ? ";justify-content:center;padding:11px 13px" : ""}" ${kpi ? `onclick="drilldownKpi('${w.id}')"` : ""}>${widgetContent(w, s)}</div>`;
+        })
+        .join("")}
+    </div>
+  </div>`;
 }
+const rupiahTick = (v) =>
+  v >= 1e6
+    ? v / 1e6 + (lang === "id" ? " jt" : " M")
+    : v >= 1000
+      ? v / 1000 + (lang === "id" ? " rb" : " k")
+      : v;
 function drawChart() {
-  const el = document.getElementById("c1");
-  if (!el) return;
+  const canvases = document.querySelectorAll("canvas[data-chart-widget]");
+  const activeIds = new Set();
   const s = seriesByDay(narrow() ? 7 : 14);
   const cs = getComputedStyle(document.documentElement);
   const cv = (n) => cs.getPropertyValue(n).trim();
-  chart1 && chart1.destroy();
-  chart1 = new Chart(el, {
-    type: "bar",
-    data: {
-      labels: s.map((x) => x.label),
-      datasets: [
-        {
-          data: s.map((x) => x.v),
-          backgroundColor: cv("--blue"),
-          hoverBackgroundColor: cv("--blue-d"),
-          borderRadius: 5,
-          maxBarThickness: 38,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: { duration: 500 },
-      layout: { padding: { top: 6 } },
-      plugins: {
-        legend: { display: false },
-        tooltip: { callbacks: { label: (c) => rp(c.parsed.y) } },
+  canvases.forEach((el) => {
+    const w = findWidget(el.dataset.chartWidget);
+    const isLine = w?.chartStyle === "line";
+    activeIds.add(el.id);
+    chartInstances[el.id]?.destroy();
+    chartInstances[el.id] = new Chart(el, {
+      type: isLine ? "line" : "bar",
+      data: {
+        labels: s.map((x) => x.label),
+        datasets: [
+          {
+            data: s.map((x) => x.v),
+            backgroundColor: isLine ? cv("--blue-s") : cv("--blue"),
+            hoverBackgroundColor: cv("--blue-d"),
+            borderColor: cv("--blue"),
+            borderWidth: isLine ? 2.5 : 0,
+            borderRadius: isLine ? 0 : 5,
+            maxBarThickness: 38,
+            tension: 0.35,
+            fill: isLine,
+            pointRadius: isLine ? 3 : 0,
+            pointBackgroundColor: cv("--blue"),
+            pointHoverRadius: 5,
+          },
+        ],
       },
-      scales: {
-        x: {
-          grid: { display: false },
-          border: { display: false },
-          ticks: { color: cv("--tx2"), font: { size: 12 } },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 500 },
+        layout: { padding: { top: 6 } },
+        onClick: (evt, elements) => {
+          if (elements.length) drilldownDate(s[elements[0].index].k);
         },
-        y: {
-          grid: { color: cv("--line2") },
-          border: { display: false },
-          ticks: {
-            color: cv("--tx2"),
-            font: { size: 12 },
-            maxTicksLimit: 4,
-            callback: (v) =>
-              v >= 1e6
-                ? v / 1e6 + (lang === "id" ? " jt" : " M")
-                : v >= 1000
-                  ? v / 1000 + (lang === "id" ? " rb" : " k")
-                  : v,
+        onHover: (evt, elements) => {
+          evt.native.target.style.cursor = elements.length ? "pointer" : "default";
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (c) => rp(c.parsed.y),
+              afterLabel: () => t("clickForDetail"),
+            },
+          },
+        },
+        scales: {
+          x: {
+            grid: { display: false },
+            border: { display: false },
+            ticks: { color: cv("--tx2"), font: { size: 12 } },
+          },
+          y: {
+            grid: { color: cv("--line2") },
+            border: { display: false },
+            ticks: { color: cv("--tx2"), font: { size: 12 }, maxTicksLimit: 4, callback: rupiahTick },
           },
         },
       },
-    },
+    });
   });
+  Object.keys(chartInstances).forEach((id) => {
+    if (!activeIds.has(id) && id.startsWith("wchart_")) {
+      chartInstances[id]?.destroy();
+      delete chartInstances[id];
+    }
+  });
+}
+function drawPies() {
+  const canvases = document.querySelectorAll("canvas[data-pie-widget]");
+  const activeIds = new Set();
+  const s = sums();
+  const cs = getComputedStyle(document.documentElement);
+  const cv = (n) => cs.getPropertyValue(n).trim();
+  canvases.forEach((el) => {
+    const w = findWidget(el.dataset.pieWidget);
+    if (!w) return;
+    const cats = widgetCatsInGroup(w);
+    const labels = cats.map((c) => c.n);
+    const data = cats.map((c) => s.byCat[c.n] || 0);
+    const total = data.reduce((a, b) => a + b, 0);
+    const colors = cats.map((c, i) => cv(PIE_COLORS[i % PIE_COLORS.length]));
+    activeIds.add(el.id);
+    chartInstances[el.id]?.destroy();
+    chartInstances[el.id] = new Chart(el, {
+      type: "doughnut",
+      data: { labels, datasets: [{ data, backgroundColor: colors, borderColor: cv("--card"), borderWidth: 2 }] },
+      plugins: [pieLabelsPlugin],
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: "62%",
+        animation: { duration: 400 },
+        onClick: (evt, elements) => {
+          if (elements.length) drilldownCat(labels[elements[0].index]);
+        },
+        onHover: (evt, elements) => {
+          evt.native.target.style.cursor = elements.length ? "pointer" : "default";
+        },
+        plugins: {
+          legend: { position: "bottom", labels: { color: cv("--tx2"), boxWidth: 10, font: { size: 11 }, padding: 10 } },
+          tooltip: {
+            callbacks: {
+              label: (c) => {
+                const v = c.parsed,
+                  pct = total ? Math.round((v / total) * 100) : 0;
+                return `${c.label}: ${rp(v)} (${pct}%)`;
+              },
+              afterLabel: () => t("clickForDetail"),
+            },
+          },
+        },
+      },
+    });
+  });
+  Object.keys(chartInstances).forEach((id) => {
+    if (!activeIds.has(id) && id.startsWith("wpie_")) {
+      chartInstances[id]?.destroy();
+      delete chartInstances[id];
+    }
+  });
+}
+
+/* ================= dashboard (editor drag/resize, admin) ================= */
+const WIDGET_TYPES = ["kpi", "chart", "pie", "table", "breakdown", "quota", "queue", "rank"];
+const WIDGET_SIZE_DEFAULT = {
+  kpi: [4, 1],
+  chart: [6, 4],
+  pie: [4, 4],
+  table: [6, 4],
+  breakdown: [4, 3],
+  quota: [4, 4],
+  queue: [4, 3],
+  rank: [4, 3],
+};
+const widgetTypeLabel = (type) =>
+  ({
+    kpi: t("wKpi"),
+    chart: t("wChart"),
+    pie: t("wPie"),
+    table: t("wTable"),
+    breakdown: t("wBreakdown"),
+    quota: t("wQuota"),
+    queue: t("wQueue"),
+    rank: t("wRank"),
+  })[type] || type;
+function vDashEditor() {
+  const widgets = S.config.dashboard?.widgets || [];
+  return `<div class="card" style="margin-bottom:12px">
+    <div class="rowsp" style="flex-wrap:wrap;gap:8px">
+      <p class="hint" style="margin:0;flex:1;min-width:220px">${t("dashEditorHint")}</p>
+      <div style="display:flex;gap:8px;flex:none">
+        <button class="btn ghost sm" onclick="openWidgetForm()">${t("addWidget")}</button>
+        <button class="btn sm" onclick="saveDashLayout()">${t("saveLayout")}</button>
+      </div>
+    </div>
+  </div>
+  <div class="card" style="padding:10px;overflow-x:auto">
+    ${
+      widgets.length
+        ? `<div class="grid-stack" id="dashGrid">${widgets
+            .map(
+              (w) => `<div class="grid-stack-item" gs-id="${w.id}" gs-x="${w.x}" gs-y="${w.y}" gs-w="${w.w}" gs-h="${w.h}">
+        <div class="grid-stack-item-content dash-tile">
+          <div class="dash-tile-head">
+            <div style="min-width:0"><b style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block">${esc(liveTitle(w.title))}</b>
+            <span class="hint">${widgetTypeLabel(w.type)}</span></div>
+            <div class="dash-tile-actions">
+              <button type="button" class="btn ghost sm icon" onclick="openWidgetForm('${w.id}')" aria-label="${t("edit")}">✎</button>
+              <button type="button" class="btn ghost sm icon" onclick="deleteDashWidget('${w.id}')" aria-label="${t("del")}">✕</button>
+            </div>
+          </div>
+        </div>
+      </div>`,
+            )
+            .join("")}</div>`
+        : `<div class="empty">${t("noneYet")}</div>`
+    }
+  </div>`;
+}
+async function initDashGrid() {
+  dashGrid?.destroy(false);
+  dashGrid = null;
+  const el = document.getElementById("dashGrid");
+  if (!el) return;
+  const GridStack = await loadGridstack();
+  // .fit sudah pindah tab kalau admin sempat berpindah screen sebelum lib
+  // ini selesai dimuat - jangan init grid pada elemen yang sudah lepas dari DOM
+  if (!document.body.contains(el)) return;
+  dashGrid = GridStack.init(
+    { column: DASHBOARD_COLS, cellHeight: DASHBOARD_ROW_H, margin: 8, float: true },
+    el,
+  );
+}
+function openWidgetForm(id) {
+  const w = id ? (S.config.dashboard?.widgets || []).find((x) => x.id === id) : null;
+  const cats = D().cats;
+  sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${w ? t("edit") : t("addWidget")}</h2>${closeBtn()}</div>
+    <input type="hidden" id="dw_id" value="${w ? w.id : ""}">
+    <div class="field"><label>${t("widgetType")}</label>
+      <select id="dw_type" onchange="onWidgetTypeChange()" ${w ? "disabled" : ""}>
+        ${WIDGET_TYPES.map((ty) => `<option value="${ty}" ${w?.type === ty ? "selected" : ""}>${widgetTypeLabel(ty)}</option>`).join("")}
+      </select></div>
+    <div class="field"><label>${t("widgetTitleLbl")}</label><input id="dw_title" value="${esc(w?.title || "")}"></div>
+    <div class="field" id="dw_style_wrap" style="display:none">
+      <label>${t("chartStyleLbl")}</label>
+      <select id="dw_style">
+        <option value="bar" ${!w || w.chartStyle !== "line" ? "selected" : ""}>${t("chartStyleBar")}</option>
+        <option value="line" ${w?.chartStyle === "line" ? "selected" : ""}>${t("chartStyleLine")}</option>
+      </select></div>
+    <div class="field" id="dw_metric_wrap" style="display:none">
+      <label>${t("metricLbl")}</label>
+      <select id="dw_metric">
+        <option value="income" ${w?.metric === "income" ? "selected" : ""}>${t("incomeW")}</option>
+        <option value="expense" ${w?.metric === "expense" ? "selected" : ""}>${t("exp")}</option>
+        <option value="net" ${w?.metric === "net" ? "selected" : ""}>${t("net")}</option>
+        <option value="pendingAmt" ${w?.metric === "pendingAmt" ? "selected" : ""}>${t("wait")}</option>
+        ${cats.map((c) => `<option value="cat:${c.id}" ${w?.metric === "cat:" + c.id ? "selected" : ""}>${esc(c.n)}</option>`).join("")}
+      </select></div>
+    <div class="field" id="dw_group_wrap" style="display:none">
+      <label>${t("groupLbl")}</label>
+      <select id="dw_group" onchange="onWidgetGroupChange()">
+        <option value="" ${w && !w.group ? "selected" : ""}>${t("allTypesLbl")}</option>
+        <option value="income" ${!w || w.group === "income" ? "selected" : ""}>${t("incomeW")}</option>
+        <option value="expense" ${w?.group === "expense" ? "selected" : ""}>${t("expW")}</option>
+      </select></div>
+    <div class="field" id="dw_cats_wrap" style="display:none">
+      <label>${t("catFilterLbl")}</label>
+      <div class="chips" id="dw_cats">${cats.map((c) => `<span class="chip ${w?.catIds?.includes(c.id) ? "on" : ""}" data-id="${c.id}" data-group="${c.group}" onclick="toggleEventChip(this)">${esc(c.n)}</span>`).join("") || `<span class="hint">${t("noneYet")}</span>`}</div>
+      <div class="hint" style="margin-top:4px">${t("catFilterHint")}</div></div>
+    <div class="rowsp" style="margin-top:14px">${w ? `<button class="btn danger" onclick="deleteDashWidget('${w.id}')">${t("del")}</button>` : "<span></span>"}
+      <button class="btn" onclick="submitWidgetForm()">${t("save")}</button></div>`);
+  onWidgetTypeChange();
+}
+const WIDGET_HAS_GROUP = ["breakdown", "pie", "table", "rank"];
+const WIDGET_HAS_CATS = ["breakdown", "pie", "table", "quota", "rank"];
+function onWidgetTypeChange() {
+  const type = document.getElementById("dw_type").value;
+  document.getElementById("dw_style_wrap").style.display = type === "chart" ? "block" : "none";
+  document.getElementById("dw_metric_wrap").style.display = type === "kpi" ? "block" : "none";
+  document.getElementById("dw_group_wrap").style.display = WIDGET_HAS_GROUP.includes(type)
+    ? "block"
+    : "none";
+  document.getElementById("dw_cats_wrap").style.display = WIDGET_HAS_CATS.includes(type)
+    ? "block"
+    : "none";
+  const titleEl = document.getElementById("dw_title");
+  if (!titleEl.value.trim()) titleEl.value = widgetTypeLabel(type);
+  onWidgetGroupChange();
+}
+// filter chip kategori yg tampil sesuai grup yg dipilih, biar admin tidak
+// bisa (secara membingungkan) mencentang kategori expense pas grupnya income
+function onWidgetGroupChange() {
+  const group = document.getElementById("dw_group")?.value;
+  document.querySelectorAll("#dw_cats .chip").forEach((el) => {
+    el.style.display = !group || el.dataset.group === group ? "" : "none";
+  });
+}
+async function submitWidgetForm() {
+  const id = val("dw_id"),
+    type = val("dw_type"),
+    title = val("dw_title") || widgetTypeLabel(type);
+  const metric = document.getElementById("dw_metric")?.value;
+  const group = document.getElementById("dw_group")?.value;
+  const chartStyle = document.getElementById("dw_style")?.value;
+  const catIds = Array.from(document.querySelectorAll("#dw_cats .chip.on")).map(
+    (el) => el.dataset.id,
+  );
+  await mutate(
+    () => {
+      if (!S.config.dashboard) S.config.dashboard = { widgets: [] };
+      const widgets = S.config.dashboard.widgets;
+      const patch = { title };
+      if (type === "chart") patch.chartStyle = chartStyle;
+      if (type === "kpi") patch.metric = metric;
+      if (WIDGET_HAS_GROUP.includes(type)) patch.group = group || undefined;
+      if (WIDGET_HAS_CATS.includes(type)) patch.catIds = catIds;
+      const i = widgets.findIndex((w) => w.id === id);
+      if (i >= 0) {
+        Object.assign(widgets[i], patch);
+      } else {
+        const maxY = widgets.reduce((m, w) => Math.max(m, w.y + w.h), 0);
+        const [w, h] = WIDGET_SIZE_DEFAULT[type] || [4, 3];
+        widgets.push({ id: uid(), type, x: 0, y: maxY, w, h, ...patch });
+      }
+    },
+    "actSet",
+    title,
+  );
+  closeSheet();
+  render();
+}
+async function deleteDashWidget(id) {
+  await mutate(
+    () => {
+      S.config.dashboard.widgets = (S.config.dashboard.widgets || []).filter((w) => w.id !== id);
+    },
+    "actSet",
+    t("del"),
+  );
+  closeSheet();
+  render();
+}
+async function saveDashLayout() {
+  if (!dashGrid) return toast(t("saveErr"));
+  const positions = {};
+  dashGrid.engine.nodes.forEach((n) => {
+    positions[n.id] = { x: n.x, y: n.y, w: n.w, h: n.h };
+  });
+  await mutate(
+    () => {
+      (S.config.dashboard?.widgets || []).forEach((w) => {
+        const p = positions[w.id];
+        if (p) Object.assign(w, p);
+      });
+    },
+    "actSet",
+    t("saveLayout"),
+  );
+  toast(t("setSaved"));
 }
 
 /* ================= transaksi ================= */
@@ -1923,8 +2853,7 @@ function vTx() {
     <div class="chips">${[
       ["all", t("all")],
       ["pending", t("unchecked")],
-      ["ticket", t("seatsW")],
-      ["donation", t("donW")],
+      ["income", t("incomeW")],
       ["expense", t("expW")],
     ]
       .map(
@@ -1950,8 +2879,8 @@ function vTx() {
       <td><div style="font-weight:600">${esc(x.name)}</div><div class="hint">${esc(x.phone || "")}${x.by ? " · " + esc(x.by) : ""}</div></td>
       <td>${
         x.type === "expense"
-          ? `<span class="tag t-exp">${t("expW")}</span> ${esc(x.cat || "")}`
-          : `<span class="tag ${x.type === "donation" ? "t-ok" : "t-tic"}">${x.type === "donation" ? t("donW") : t("seatsW")}</span> ${esc(x.cat || "")} · ${x.seats || 0}`
+          ? `<span class="tag t-exp">${t("expW")}</span> ${esc(catLabel(x))}`
+          : `<span class="tag t-tic">${t("incomeW")}</span> ${esc(catLabel(x))}${x.seats ? " · " + x.seats : ""}`
       }
         <div class="hint">${esc(x.bank || "-")}${x.chequeNo ? " · " + t("chequeNo") + " " + esc(x.chequeNo) : ""}${x.note ? " · " + esc(x.note) : ""}</div></td>
       <td class="mono ${x.type === "expense" ? "neg" : ""}" style="text-align:right;white-space:nowrap;font-weight:600">${x.type === "expense" ? "−" : ""}${rp(x.amount)}
@@ -1982,52 +2911,59 @@ async function verify(id) {
   render();
 }
 function openTx(id) {
+  const cats = D().cats;
   const x = id
     ? S.tx.find((v) => v.id === id)
     : {
         id: "",
-        type: "ticket",
+        type: "income",
         date: today(),
         name: "",
         phone: "",
-        cat: D().cats[0]?.n || "",
-        seats: 1,
-        amount: D().cats[0]?.p || 0,
+        cat: "",
+        tier: "",
+        seats: 0,
+        amount: 0,
         bank: D().methods[0]?.name || "",
+        bankName: "",
         note: "",
         proof: "",
         status: "pending",
       };
+  if (!cats.length) {
+    sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${id ? t("editTx") : t("newTx")}</h2>${closeBtn()}</div>
+      <div class="empty">${t("noCatYet")}</div>`);
+    return;
+  }
+  const initialGroup = x.type === "expense" ? "expense" : "income";
   sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${id ? t("editTx") : t("newTx")}</h2>
       ${closeBtn()}</div>
-    <div class="chips" style="margin-bottom:14px" id="typeChips">
-      ${[
-        ["ticket", t("tBuy")],
-        ["donation", t("tDon")],
-        ["expense", t("tExp")],
-      ]
-        .map(
-          ([k, l]) =>
-            `<button class="chip ${x.type === k ? "on" : ""}" data-k="${k}" onclick="setType('${k}')">${l}</button>`,
-        )
-        .join("")}</div>
     <input type="hidden" id="f_id" value="${x.id}"><input type="hidden" id="f_type" value="${x.type}">
+    <div class="seg" id="txTabs" style="margin-bottom:14px">
+      <button type="button" class="${initialGroup === "income" ? "on" : ""}" data-g="income" onclick="setTxTab('income')">${t("incomeW")}</button>
+      <button type="button" class="${initialGroup === "expense" ? "on" : ""}" data-g="expense" onclick="setTxTab('expense')">${t("expW")}</button>
+    </div>
+    <div class="field" style="margin-bottom:14px">
+      <label id="l_cat">${t("txCat")}</label>
+      <select id="f_cat" onchange="onCatChange()"></select>
+    </div>
+    <div class="field" id="w_tier" style="display:none;margin-bottom:14px">
+      <label>${t("tierLbl")}</label>
+      <select id="f_tier" onchange="onTierChange()"></select>
+    </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
       <div class="field"><label>${t("date")}</label><input type="date" id="f_date" value="${x.date}"></div>
-      <div class="field"><label id="l_bank">${t("bankTo")}</label><select id="f_bank" onchange="onMethodChange()">${D()
+      <div class="field"><label id="l_bank">${t("paymentMethod")}</label><select id="f_bank" onchange="onMethodChange()">${D()
         .methods.map(
           (m) =>
             `<option value="${esc(m.name)}" data-type="${m.type}" ${m.name === x.bank ? "selected" : ""}>${esc(m.name)}</option>`,
         )
         .join("")}</select></div>
-      <div class="field" id="w_name"><label id="l_name">${t("nameBuy")}</label><input id="f_name" value="${esc(x.name)}"></div>
+      <div class="field" id="w_bankName" style="display:none">
+        <label>${t("bankNameLbl")}</label>
+        <select id="f_bankName">${INDONESIA_BANKS.map((b) => `<option ${b === x.bankName ? "selected" : ""}>${esc(b)}</option>`).join("")}</select></div>
+      <div class="field" id="w_name"><label id="l_name">${t("nameGeneric")}</label><input id="f_name" value="${esc(x.name)}"></div>
       <div class="field" id="w_phone"><label>${t("wa")}</label><input id="f_phone" inputmode="tel" value="${esc(x.phone)}" placeholder="0812..."></div>
-      <div class="field" id="w_cat"><label id="l_cat">${t("catSeat")}</label><select id="f_cat" onchange="recalc()">${D()
-        .cats.map(
-          (c) =>
-            `<option ${c.n === x.cat ? "selected" : ""}>${esc(c.n)}</option>`,
-        )
-        .join("")}</select></div>
       <div class="field" id="w_seats"><label>${t("nSeat")}</label>
         <div class="stepper">
           <button type="button" class="step-btn" onclick="stepSeats(-1)" aria-label="-">−</button>
@@ -2035,28 +2971,20 @@ function openTx(id) {
           <button type="button" class="step-btn" onclick="stepSeats(1)" aria-label="+">+</button>
         </div></div>
     </div>
-    <div class="field" id="w_expcat" style="display:none">
-      <label>${t("purpose")}</label><input id="f_expcat" value="${x.type === "expense" ? esc(x.cat) : ""}">
-    </div>
-    <div class="field" id="w_cash" style="display:none">
-      <label>${t("cashBreakdown")}</label>
-      <div class="grid" style="grid-template-columns:repeat(3,1fr)">${CASH_DENOMS.map(
-        (d) =>
-          `<div class="field"><label>${rp(d)}</label><input type="number" min="0" inputmode="numeric" class="cash-denom" data-denom="${d}" value="${(x.cashBreakdown && x.cashBreakdown[d]) || 0}" oninput="recalcCash()"></div>`,
-      ).join("")}</div>
-    </div>
     <div class="grid" id="w_cheque" style="display:none;grid-template-columns:1fr 1fr 1fr">
       <div class="field"><label>${t("chequeNo")}</label><input id="f_chequeNo" value="${esc(x.chequeNo || "")}"></div>
       <div class="field"><label>${t("chequeBank")}</label><input id="f_chequeBank" value="${esc(x.chequeBank || "")}"></div>
       <div class="field"><label>${t("chequeDate")}</label><input type="date" id="f_chequeDate" value="${x.chequeDate || ""}"></div>
     </div>
     <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev()">
+      <div class="field amt-field"><label id="l_amount">${t("amtIn")}</label><input type="number" inputmode="numeric" id="f_amount" value="${x.amount}" oninput="prev();updateBonusHint()">
         <div class="hint mono" id="prev" style="margin-top:4px">${rp(x.amount)}</div></div>
       <div class="field"><label>${t("status")}</label><select id="f_status">
         <option value="pending" ${x.status === "pending" ? "selected" : ""}>${t("stW")}</option>
         <option value="verified" ${x.status === "verified" ? "selected" : ""}>${t("stV")}</option></select></div></div>
+    <div id="w_bonusHint" style="display:none;margin-bottom:14px"></div>
     <div class="field"><label>${t("note")}</label><textarea id="f_note" rows="2">${esc(x.note)}</textarea></div>
+    <div class="field"><label>${t("note2")}</label><textarea id="f_note2" rows="2">${esc(x.note2 || "")}</textarea></div>
     <div class="field"><label>${t("proof")}</label>
       <div class="filepick">
         <button type="button" class="btn ghost sm" onclick="document.getElementById('f_proofFile').click()">${t("chooseFile")}</button>
@@ -2079,7 +3007,9 @@ function openTx(id) {
     })()}
     <div class="rowsp" style="margin-top:14px">${id ? `<button class="btn danger" onclick="delTx('${id}')">${t("del")}</button>` : "<span></span>"}
       <button class="btn" onclick="saveTx()">${t("save")}</button></div>`);
-  setType(x.type, true);
+  setTxTab(initialGroup, x);
+  initCombobox("f_cat");
+  initCombobox("f_bankName");
 }
 function sheet(html) {
   const m = document.createElement("div");
@@ -2158,35 +3088,91 @@ function viewProofById(id) {
   const x = S.tx.find((v) => v.id === id);
   if (x && x.proof) viewProof(x.proof);
 }
-function setType(k, init) {
-  document.getElementById("f_type").value = k;
+// tab Pemasukan/Pengeluaran di atas dropdown kategori - membatasi pilihan
+// kategori ke grup yg aktif, jadi admin tak perlu menyisir daftar gabungan
+function catOptionHtml(c) {
+  const tiersJson = esc(JSON.stringify(c.tiers || [])).replace(/'/g, "&#39;");
+  return `<option value="${esc(c.n)}" data-qty="${c.hasQty ? 1 : 0}" data-price="${c.p || 0}" data-tiers='${tiersJson}'>${esc(c.n)}</option>`;
+}
+function setTxTab(group, x) {
   document
-    .querySelectorAll("#typeChips .chip")
-    .forEach((c) => c.classList.toggle("on", c.dataset.k === k));
-  const e = k === "expense";
-  ["w_cat", "w_seats"].forEach(
-    (i) => (document.getElementById(i).style.display = e ? "none" : "block"),
-  );
+    .querySelectorAll("#txTabs button")
+    .forEach((b) => b.classList.toggle("on", b.dataset.g === group));
+  const cats = D().cats.filter((c) => c.group === group);
+  const sel = document.getElementById("f_cat");
+  sel.innerHTML = cats.length
+    ? cats.map(catOptionHtml).join("")
+    : `<option value="" disabled>${t("noCatYet")}</option>`;
+  if (x && cats.some((c) => c.n === x.cat)) sel.value = x.cat;
+  syncCombo("f_cat");
+  onCatChange(true, x);
+}
+// dipanggil tiap kali kategori transaksi diganti - grup (income/expense)
+// sekarang datang dari tab yg aktif, bukan dari option itu sendiri; apakah
+// kategori itu "melacak jumlah" & daftar tingkat harganya (mis. Pembelian
+// Kursi -> Platinum/Gold/Silver) ada di data-attribute option, lihat
+// catOptionHtml()
+function onCatChange(init, x) {
+  const opt = document.getElementById("f_cat")?.selectedOptions[0];
+  const group = document.querySelector("#txTabs button.on")?.dataset.g || "income",
+    hasQty = opt?.dataset.qty === "1",
+    tiers = opt?.dataset.tiers ? JSON.parse(opt.dataset.tiers) : [];
+  document.getElementById("f_type").value = group;
+  const e = group === "expense";
+  const tierWrap = document.getElementById("w_tier"),
+    tierSel = document.getElementById("f_tier");
+  tierWrap.style.display = tiers.length ? "block" : "none";
+  if (tiers.length) {
+    tierSel.innerHTML = tiers
+      .map((tr) => `<option value="${esc(tr.name)}" data-price="${tr.p}">${esc(tr.name)} (${rp(tr.p)})</option>`)
+      .join("");
+    const want = init && x?.tier ? x.tier : tierSel.value;
+    if (tiers.some((tr) => tr.name === want)) tierSel.value = want;
+  }
+  document.getElementById("w_seats").style.display = hasQty ? "block" : "none";
   document.getElementById("w_phone").style.display = e ? "none" : "block";
-  // pengeluaran menyembunyikan phone/cat/seats, jadi field nama jadi sendirian
-  // di barisnya - bentangkan penuh 2 kolom biar tidak kelihatan terpotong separuh
+  // pengeluaran menyembunyikan phone, jadi field nama jadi sendirian di
+  // barisnya - bentangkan penuh 2 kolom biar tidak kelihatan terpotong separuh
   document.getElementById("w_name").style.gridColumn = e ? "1 / -1" : "";
-  document.getElementById("w_expcat").style.display = e ? "block" : "none";
-  document.getElementById("l_name").textContent = e
-    ? t("namePay")
-    : k === "donation"
-      ? t("nameDon")
-      : t("nameBuy");
-  document.getElementById("l_bank").textContent = e
-    ? t("bankFrom")
-    : t("bankTo");
-  document.getElementById("l_amount").textContent = e
-    ? t("amtOut")
-    : t("amtIn");
-  document.getElementById("l_cat").textContent =
-    k === "donation" ? t("catFree") : t("catSeat");
-  if (!init && k === "ticket") recalc();
+  document.getElementById("l_name").textContent = e ? t("namePay") : t("nameGeneric");
+  if (!init) {
+    if (hasQty) recalc();
+    else {
+      const price = tiers.length ? +tiers[0]?.p || 0 : +(opt?.dataset.price || 0);
+      if (price) {
+        document.getElementById("f_amount").value = price;
+        prev();
+      }
+    }
+  }
   onMethodChange();
+  updateBonusHint();
+}
+function onTierChange() {
+  recalc();
+}
+// hint informasional (bukan otomatis mencatat transaksi baru) - kalau
+// kategori yg dipilih (mis. Sponsor) punya bonusRules dan nominalnya
+// memenuhi syarat, tampilkan apa yg berhak didapat penyumbangnya
+function updateBonusHint() {
+  const hintEl = document.getElementById("w_bonusHint");
+  const catOpt = document.getElementById("f_cat")?.selectedOptions[0];
+  const cat = D().cats.find((c) => c.n === catOpt?.value);
+  if (!cat?.bonusRules?.length) {
+    hintEl.style.display = "none";
+    return;
+  }
+  const amt = +document.getElementById("f_amount")?.value || 0;
+  const applicable = cat.bonusRules
+    .filter((r) => amt >= r.minAmount)
+    .sort((a, b) => b.minAmount - a.minAmount)[0];
+  if (!applicable) {
+    hintEl.style.display = "none";
+    return;
+  }
+  const targetCat = D().cats.find((c) => c.id === applicable.targetCatId);
+  hintEl.style.display = "block";
+  hintEl.innerHTML = `<div class="hint" style="padding:10px 12px;background:var(--blue-s);border-radius:9px;color:var(--blue)">${t("bonusHint", { qty: applicable.freeQty, tier: applicable.targetTier, cat: targetCat?.n || "" })}</div>`;
 }
 function stepSeats(d) {
   const el = document.getElementById("f_seats");
@@ -2194,65 +3180,146 @@ function stepSeats(d) {
   recalc();
 }
 function recalc() {
-  if (document.getElementById("f_type").value !== "ticket") return;
-  const c = D().cats.find(
-    (x) => x.n === document.getElementById("f_cat").value,
-  );
-  if (c) {
-    document.getElementById("f_amount").value =
-      (+document.getElementById("f_seats").value || 0) * c.p;
-    prev();
-  }
+  const opt = document.getElementById("f_cat")?.selectedOptions[0];
+  if (!opt || opt.dataset.qty !== "1") return;
+  const tierVisible = document.getElementById("w_tier").style.display !== "none";
+  const price = tierVisible
+    ? +(document.getElementById("f_tier")?.selectedOptions[0]?.dataset.price || 0)
+    : +(opt.dataset.price || 0);
+  document.getElementById("f_amount").value = (+document.getElementById("f_seats").value || 0) * price;
+  prev();
 }
 function currentMethodType() {
   const sel = document.getElementById("f_bank");
   return sel?.selectedOptions[0]?.dataset.type || "bank";
 }
+// dropdown panjang (kategori, daftar bank, acara) susah dicari manual - bukan
+// search-box + <select> terpisah (2 elemen), tapi SATU field gabungan:
+// <select> aslinya disembunyikan (tetap dipakai sbg sumber kebenaran, semua
+// logika data-attribute/onchange yg sudah ada tidak berubah), lalu di
+// depannya dipasang <input> yg sekaligus jadi tampilan nilai terpilih DAN
+// kotak pencarian - fokus/ketik membuka daftar opsi yg cocok, klik salah
+// satu men-set select-nya lalu memicu event "change" spt biasa
+function initCombobox(selectId, placeholder) {
+  const sel = document.getElementById(selectId);
+  if (!sel || sel.dataset.comboInit) return;
+  sel.dataset.comboInit = "1";
+  sel.classList.add("combo-native");
+  const wrap = document.createElement("div");
+  wrap.className = "combobox";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "combo-input";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.placeholder = placeholder || t("searchPlaceholder");
+  const list = document.createElement("div");
+  list.className = "combo-list";
+  const currentLabel = () => {
+    const o = sel.selectedOptions[0];
+    return o && o.value !== "" ? o.textContent : "";
+  };
+  const closeList = () => list.classList.remove("open");
+  const renderList = (filterText) => {
+    const q = (filterText || "").trim().toLowerCase();
+    const opts = Array.from(sel.options).filter((o) => !o.disabled);
+    const filtered = opts.filter((o) => !q || o.textContent.toLowerCase().includes(q));
+    list.innerHTML = filtered.length
+      ? filtered
+          .map(
+            (o) =>
+              `<div class="combo-opt${o.value === sel.value ? " sel" : ""}" data-value="${esc(o.value)}">${esc(o.textContent)}</div>`,
+          )
+          .join("")
+      : `<div class="combo-empty">${t("noneYet")}</div>`;
+  };
+  input.addEventListener("focus", () => {
+    input.select();
+    renderList("");
+    list.classList.add("open");
+  });
+  input.addEventListener("input", () => {
+    renderList(input.value);
+    list.classList.add("open");
+  });
+  list.addEventListener("mousedown", (e) => {
+    const optEl = e.target.closest(".combo-opt");
+    if (!optEl) return;
+    e.preventDefault();
+    sel.value = optEl.dataset.value;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    input.value = currentLabel();
+    closeList();
+  });
+  input.addEventListener("blur", () => {
+    setTimeout(() => {
+      input.value = currentLabel();
+      closeList();
+    }, 150);
+  });
+  wrap.appendChild(input);
+  wrap.appendChild(list);
+  sel.parentNode.insertBefore(wrap, sel);
+  input.value = currentLabel();
+  // fungsi lain (mis. setTxTab saat ganti tab income/expense) mengubah
+  // value/opsi select scr programatik - panggil syncCombo(selectId) sesudahnya
+  // supaya teks yg tampil di field ikut ter-update
+  sel._comboSync = () => {
+    input.value = currentLabel();
+  };
+}
+function syncCombo(selectId) {
+  document.getElementById(selectId)?._comboSync?.();
+}
+// label field nominal harus sesuai metode pembayaran yg dipilih - "Nominal
+// transfer" tidak masuk akal utk Tunai/Utang/Cek, jadi labelnya menyesuaikan
+function amountLabelFor(type, isExpense) {
+  if (type === "cash") return t("amtCash");
+  if (type === "cheque") return t("amtCheque");
+  if (type === "debt") return t("amtDebt");
+  if (type === "other") return t("amount");
+  return isExpense ? t("amtOut") : t("amtIn");
+}
 function onMethodChange() {
   const type = currentMethodType();
-  document.getElementById("w_cash").style.display = type === "cash" ? "block" : "none";
   document.getElementById("w_cheque").style.display = type === "cheque" ? "grid" : "none";
-  const amt = document.getElementById("f_amount");
-  amt.readOnly = type === "cash";
-  if (type === "cash") recalcCash();
-}
-function recalcCash() {
-  let total = 0;
-  document
-    .querySelectorAll(".cash-denom")
-    .forEach((inp) => (total += (+inp.dataset.denom || 0) * (+inp.value || 0)));
-  document.getElementById("f_amount").value = total;
-  prev();
+  document.getElementById("w_bankName").style.display = type === "bank" ? "block" : "none";
+  const isExpense = document.querySelector("#txTabs button.on")?.dataset.g === "expense";
+  document.getElementById("l_amount").textContent = amountLabelFor(type, isExpense);
+  // utang belum ada uang yg benar2 diterima/dibayarkan - default status ke
+  // "belum lunas" tiap kali metode diganti ke utang (masih bisa diubah manual
+  // nanti kalau utangnya sudah dilunasi)
+  if (type === "debt") {
+    const st = document.getElementById("f_status");
+    if (st) st.value = "pending";
+  }
 }
 async function saveTx() {
   const g = (i) => document.getElementById("f_" + i).value,
-    ty = g("type"),
     id = g("id"),
-    methodType = currentMethodType();
+    methodType = currentMethodType(),
+    catOpt = document.getElementById("f_cat")?.selectedOptions[0],
+    ty = document.querySelector("#txTabs button.on")?.dataset.g || "income",
+    hasQty = catOpt?.dataset.qty === "1",
+    tiers = catOpt?.dataset.tiers ? JSON.parse(catOpt.dataset.tiers) : [];
   const x = {
     id: id || uid(),
     type: ty,
     date: g("date") || today(),
     name: g("name").trim() || "—",
     phone: ty === "expense" ? "" : g("phone"),
-    cat:
-      ty === "expense" ? document.getElementById("f_expcat").value : g("cat"),
-    seats: ty === "expense" ? 0 : +g("seats") || 0,
+    cat: g("cat"),
+    tier: tiers.length ? g("tier") : "",
+    seats: hasQty ? +g("seats") || 0 : 0,
     amount: +g("amount") || 0,
     bank: g("bank"),
+    bankName: methodType === "bank" ? g("bankName") : "",
     methodType,
-    cashBreakdown:
-      methodType === "cash"
-        ? Object.fromEntries(
-            Array.from(document.querySelectorAll(".cash-denom"))
-              .filter((i) => +i.value > 0)
-              .map((i) => [i.dataset.denom, +i.value]),
-          )
-        : {},
     chequeNo: methodType === "cheque" ? g("chequeNo") : "",
     chequeBank: methodType === "cheque" ? g("chequeBank") : "",
     chequeDate: methodType === "cheque" ? g("chequeDate") : "",
     note: g("note"),
+    note2: g("note2"),
     proof: g("proof"),
     status: g("status"),
     by: acting().name,
@@ -2296,30 +3363,37 @@ async function delTx(id) {
 /* ================= peringkat ================= */
 function vBoard() {
   const BOARD_SIZE = 10;
-  const {
-    items: a,
-    page: pageBuy,
-    totalPages: totalBuy,
-  } = paginate(byPerson("ticket"), boardBuyPage, BOARD_SIZE);
-  const {
-    items: b,
-    page: pageDon,
-    totalPages: totalDon,
-  } = paginate(byPerson("donation"), boardDonPage, BOARD_SIZE);
-  const row = (
-    x,
-    rank,
-    u,
-  ) => `<div class="lb" style="animation-delay:${((rank - 1) % BOARD_SIZE) * 35}ms"><div class="rank ${rank === 1 ? "g1" : ""}">${rank}</div>
-    <div style="flex:1;min-width:0"><div style="font-weight:600">${esc(x.name)}</div>
-    <div class="hint">${x.n} ${t("trans")} · ${x.seats} ${t("seatsW").toLowerCase()}${u}</div></div>
-    <div class="mono" style="font-weight:700">${rp(x.amount)}</div></div>`;
+  const qtyNames = D()
+      .cats.filter((c) => c.group === "income" && c.hasQty)
+      .map((c) => c.n),
+    flatNames = D()
+      .cats.filter((c) => c.group === "income" && !c.hasQty)
+      .map((c) => c.n);
+  const allBuy = byPerson(qtyNames),
+    allDon = byPerson(flatNames);
+  const { items: a, page: pageBuy, totalPages: totalBuy } = paginate(allBuy, boardBuyPage, BOARD_SIZE);
+  const { items: b, page: pageDon, totalPages: totalDon } = paginate(allDon, boardDonPage, BOARD_SIZE);
+  const maxBuy = allBuy.reduce((m, x) => Math.max(m, x.amount), 0) || 1;
+  const maxDon = allDon.reduce((m, x) => Math.max(m, x.amount), 0) || 1;
+  // dipakai medal + bar proporsi yg sama dgn renderRankWidget() di dashboard,
+  // supaya bahasa visualnya konsisten di seluruh app - lihat MEDAL_COLORS
+  const row = (x, rank, max) => {
+    const pct = Math.max(6, Math.round((x.amount / max) * 100));
+    const medal = rank <= 3 ? MEDAL_COLORS[rank - 1] : null;
+    const detail = `${x.n} ${t("trans")}${x.seats ? " · " + x.seats + " " + t("seatsW").toLowerCase() : ""}`;
+    return `<div class="rank-row" style="animation:slidein .3s var(--ease) backwards;animation-delay:${((rank - 1) % BOARD_SIZE) * 35}ms" title="${esc(detail)}">
+      <div class="rank-badge" style="${medal ? `background:${medal};color:#fff` : "background:var(--line2);color:var(--tx2)"}">${rank}</div>
+      <div style="flex:1;min-width:0">
+        <div class="rowsp" style="gap:8px"><span class="rank-name">${esc(x.name)}</span><span class="mono rank-amt">${rp(x.amount)}</span></div>
+        <div class="rank-bar"><i style="width:${pct}%;background:${medal || "var(--blue)"}"></i></div>
+      </div></div>`;
+  };
   return `<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(330px,1fr));padding:12px 0 110px">
-    <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("topBuy")}</h2>
-      ${a.map((x, i) => row(x, (pageBuy - 1) * BOARD_SIZE + i + 1, "")).join("") || `<div class="empty">${t("noneYet")}</div>`}
+    <div class="card"><h2 style="font-size:17px;margin-bottom:8px">${t("topBuy")}</h2>
+      ${a.map((x, i) => row(x, (pageBuy - 1) * BOARD_SIZE + i + 1, maxBuy)).join("") || `<div class="empty">${t("noneYet")}</div>`}
       ${pagerHtml(pageBuy, totalBuy, "setBoardBuyPage")}</div>
-    <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("topDon")}</h2>
-      ${b.map((x, i) => row(x, (pageDon - 1) * BOARD_SIZE + i + 1, " " + t("free"))).join("") || `<div class="empty">${t("noneYet")}</div>`}
+    <div class="card"><h2 style="font-size:17px;margin-bottom:8px">${t("topDon")}</h2>
+      ${b.map((x, i) => row(x, (pageDon - 1) * BOARD_SIZE + i + 1, maxDon)).join("") || `<div class="empty">${t("noneYet")}</div>`}
       ${pagerHtml(pageDon, totalDon, "setBoardDonPage")}</div></div>`;
 }
 
@@ -2330,13 +3404,14 @@ function vAdmin() {
     <div class="seg" style="margin-bottom:12px">${[
       ["logs", t("logs")],
       ["set", t("set")],
+      ["dashboard", t("dashboardTab")],
     ]
       .map(
         ([k, l]) =>
           `<button class="${adminTab === k ? "on" : ""}" onclick="setAdminTab('${k}')">${l}</button>`,
       )
       .join("")}</div>
-    ${{ logs: vLogs, set: vSet }[adminTab]()}</div>`;
+    ${{ logs: vLogs, set: vSet, dashboard: vDashEditor }[adminTab]()}</div>`;
 }
 function vHubStaff() {
   const q = hubStaffQ.toLowerCase();
@@ -2584,15 +3659,21 @@ function vSet() {
     <div><button class="btn" onclick="saveSet()">${t("saveSet")}</button></div></div>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(330px,1fr))">
     <div class="card"><h2 style="font-size:17px;margin-bottom:4px">${t("catTitle")}</h2>
-      <div style="overflow-x:auto"><table><thead><tr><th>${t("name")}</th><th>${t("price")}</th><th>${t("quota")}</th><th></th></tr></thead><tbody>
+      <div style="overflow-x:auto"><table style="min-width:640px"><thead><tr><th style="min-width:120px">${t("name")}</th><th style="min-width:110px">${t("groupLbl")}</th><th style="min-width:90px">${t("price")}</th><th style="min-width:70px">${t("qtyLbl")}</th><th style="min-width:80px">${t("quota")}</th><th style="min-width:80px"></th><th></th></tr></thead><tbody>
       ${D()
         .cats.map(
           (
             c,
             i,
           ) => `<tr><td><input value="${esc(c.n)}" onchange="editCat(${i},'n',this.value)"></td>
+        <td><select style="width:100%" onchange="editCat(${i},'group',this.value)">
+          <option value="income" ${c.group === "income" ? "selected" : ""}>${t("incomeW")}</option>
+          <option value="expense" ${c.group === "expense" ? "selected" : ""}>${t("expW")}</option>
+        </select></td>
         <td><input type="number" value="${c.p}" onchange="editCat(${i},'p',+this.value)"></td>
-        <td><input type="number" value="${c.q}" onchange="editCat(${i},'q',+this.value)"></td>
+        <td style="text-align:center"><input type="checkbox" ${c.hasQty ? "checked" : ""} onchange="editCat(${i},'hasQty',this.checked)"></td>
+        <td><input type="number" value="${c.q}" ${c.hasQty ? "" : "disabled"} onchange="editCat(${i},'q',+this.value)"></td>
+        <td><button class="btn ghost sm" onclick="openTierManager(${i})">${t("tiersBtn", { n: (c.tiers || []).length })}</button></td>
         <td><button class="btn danger sm" onclick="delCat(${i})">${t("del")}</button></td></tr>`,
         )
         .join("")}
@@ -2607,6 +3688,7 @@ function vSet() {
           <option value="bank" ${m.type === "bank" ? "selected" : ""}>${t("methodBank")}</option>
           <option value="cash" ${m.type === "cash" ? "selected" : ""}>${t("methodCash")}</option>
           <option value="cheque" ${m.type === "cheque" ? "selected" : ""}>${t("methodCheque")}</option>
+          <option value="debt" ${m.type === "debt" ? "selected" : ""}>${t("methodDebt")}</option>
           <option value="other" ${m.type === "other" ? "selected" : ""}>${t("methodOther")}</option>
         </select></td>
         <td><button class="btn danger sm" onclick="delMethod(${i})">${t("del")}</button></td></tr>`,
@@ -2728,11 +3810,149 @@ async function delTplCol(i) {
 async function addCat() {
   await mutate(
     () => {
-      S.config.cats.push({ n: "—", p: 0, q: 0 });
+      S.config.cats.push({ id: uid(), n: "—", group: "income", hasQty: false, p: 0, q: 0 });
     },
     "actSet",
     t("addCat"),
   );
+  render();
+}
+// kategori bertingkat (mis. "Pembelian Kursi" -> Platinum/Gold/Silver, tiap
+// tingkat harga sendiri) - dikelola lewat sheet kecil per kategori, bukan
+// dijejalkan ke tabel kategori yg sudah padat kolomnya
+function openTierManager(catIdx) {
+  const c = S.config.cats[catIdx];
+  if (!c) return;
+  const tieredCats = S.config.cats.filter((tc) => tc.tiers && tc.tiers.length);
+  sheet(`<div class="rowsp" style="margin-bottom:10px"><h2 style="font-size:19px">${t("tiersFor", { n: esc(c.n) })}</h2>${closeBtn()}</div>
+    <p class="hint" style="margin:0 0 12px">${t("tiersHint")}</p>
+    <div style="overflow-x:auto"><table><thead><tr><th>${t("tierName")}</th><th>${t("price")}</th><th></th></tr></thead><tbody>
+    ${
+      (c.tiers || [])
+        .map(
+          (tr, i) => `<tr><td><input value="${esc(tr.name)}" onchange="editTier(${catIdx},${i},'name',this.value)"></td>
+      <td><input type="number" value="${tr.p}" onchange="editTier(${catIdx},${i},'p',+this.value)"></td>
+      <td><button class="btn danger sm" onclick="delTier(${catIdx},${i})">${t("del")}</button></td></tr>`,
+        )
+        .join("") || `<tr><td colspan="3" class="empty">${t("noneYet")}</td></tr>`
+    }
+    </tbody></table></div>
+    <div style="margin-top:10px"><button class="btn ghost sm" onclick="addTier(${catIdx})">${t("addTier")}</button></div>
+    <h2 style="font-size:16px;margin-top:22px">${t("bonusRulesTitle")}</h2>
+    <p class="hint" style="margin:4px 0 12px">${t("bonusRulesHint")}</p>
+    ${
+      tieredCats.length
+        ? `<div style="overflow-x:auto"><table><thead><tr><th>${t("bonusMinAmt")}</th><th>${t("bonusTargetCat")}</th><th>${t("bonusTargetTier")}</th><th>${t("bonusQty")}</th><th></th></tr></thead><tbody>
+      ${
+        (c.bonusRules || [])
+          .map((r, i) => {
+            const targetCat = tieredCats.find((tc) => tc.id === r.targetCatId) || tieredCats[0];
+            return `<tr>
+          <td><input type="number" value="${r.minAmount || 0}" onchange="editBonusRule(${catIdx},${i},'minAmount',+this.value)"></td>
+          <td><select onchange="editBonusRule(${catIdx},${i},'targetCatId',this.value)">
+            ${tieredCats.map((tc) => `<option value="${tc.id}" ${tc.id === (r.targetCatId || targetCat?.id) ? "selected" : ""}>${esc(tc.n)}</option>`).join("")}
+          </select></td>
+          <td><select onchange="editBonusRule(${catIdx},${i},'targetTier',this.value)">
+            ${(targetCat?.tiers || []).map((tr) => `<option ${tr.name === r.targetTier ? "selected" : ""}>${esc(tr.name)}</option>`).join("")}
+          </select></td>
+          <td><input type="number" value="${r.freeQty || 0}" onchange="editBonusRule(${catIdx},${i},'freeQty',+this.value)"></td>
+          <td><button class="btn danger sm" onclick="delBonusRule(${catIdx},${i})">${t("del")}</button></td></tr>`;
+          })
+          .join("") || `<tr><td colspan="5" class="empty">${t("noneYet")}</td></tr>`
+      }
+      </tbody></table></div>
+      <div style="margin-top:10px"><button class="btn ghost sm" onclick="addBonusRule(${catIdx})">${t("addBonusRule")}</button></div>`
+        : `<p class="hint">${t("bonusNeedsTiers")}</p>`
+    }
+    <div class="rowsp" style="margin-top:16px"><span></span><button class="btn" onclick="closeSheet()">${t("close")}</button></div>`);
+}
+async function addBonusRule(catIdx) {
+  const tieredCats = S.config.cats.filter((tc) => tc.tiers && tc.tiers.length);
+  if (!tieredCats.length) return;
+  await mutate(
+    () => {
+      const c = S.config.cats[catIdx];
+      if (!c.bonusRules) c.bonusRules = [];
+      c.bonusRules.push({
+        id: uid(),
+        minAmount: 0,
+        targetCatId: tieredCats[0].id,
+        targetTier: tieredCats[0].tiers[0].name,
+        freeQty: 1,
+      });
+    },
+    "actSet",
+    t("addBonusRule"),
+  );
+  closeSheet();
+  openTierManager(catIdx);
+  render();
+}
+async function editBonusRule(catIdx, ruleIdx, k, v) {
+  await mutate(
+    () => {
+      const rule = S.config.cats[catIdx].bonusRules[ruleIdx];
+      rule[k] = v;
+      // ganti target kategori -> tier lama mungkin tak ada di kategori baru,
+      // reset ke tier pertamanya
+      if (k === "targetCatId") {
+        const tc = S.config.cats.find((c) => c.id === v);
+        rule.targetTier = tc?.tiers?.[0]?.name || "";
+      }
+    },
+    "actSet",
+    t("catTitle"),
+  );
+  if (k === "targetCatId") {
+    closeSheet();
+    openTierManager(catIdx);
+  }
+}
+async function delBonusRule(catIdx, ruleIdx) {
+  await mutate(
+    () => {
+      S.config.cats[catIdx].bonusRules.splice(ruleIdx, 1);
+    },
+    "actSet",
+    t("del"),
+  );
+  closeSheet();
+  openTierManager(catIdx);
+  render();
+}
+async function addTier(catIdx) {
+  await mutate(
+    () => {
+      const c = S.config.cats[catIdx];
+      if (!c.tiers) c.tiers = [];
+      c.tiers.push({ id: uid(), name: "—", p: 0 });
+    },
+    "actSet",
+    t("addTier"),
+  );
+  closeSheet();
+  openTierManager(catIdx);
+  render();
+}
+async function editTier(catIdx, tierIdx, k, v) {
+  await mutate(
+    () => {
+      S.config.cats[catIdx].tiers[tierIdx][k] = v;
+    },
+    "actSet",
+    t("catTitle"),
+  );
+}
+async function delTier(catIdx, tierIdx) {
+  await mutate(
+    () => {
+      S.config.cats[catIdx].tiers.splice(tierIdx, 1);
+    },
+    "actSet",
+    t("del"),
+  );
+  closeSheet();
+  openTierManager(catIdx);
   render();
 }
 async function delCat(i) {
@@ -2795,8 +4015,8 @@ function txInPeriod(x, kind, refDate) {
 }
 function cellValue(x, c, no) {
   if (c.f === "no") return no;
-  if (c.f === "type")
-    return { ticket: t("tBuy"), donation: t("tDon"), expense: t("tExp") }[x.type];
+  if (c.f === "type") return { income: t("incomeW"), expense: t("expW") }[x.type];
+  if (c.f === "cat") return catLabel(x);
   if (c.f === "debit") return x.type === "expense" ? null : x.amount;
   if (c.f === "credit") return x.type === "expense" ? x.amount : null;
   if (c.f === "status") return x.status === "verified" ? t("inRek") : t("stW");
@@ -2882,54 +4102,146 @@ async function downloadWorkbook(wb, filename) {
 }
 
 /* ================= impor ================= */
+// kolom yg wajib diisi saat impor (dicek berdasar field key, bukan teks
+// header, supaya tetap benar walau admin sudah mengubah nama kolomnya)
+const MANDATORY_FIELDS = ["date", "name", "cat", "amount", "bank", "status"];
 async function dlTemplate() {
   const id = lang === "id";
-  const ex = [
-    {
-      type: "ticket",
-      name: "Michael Jonathan",
-      phone: "081234567890",
-      cat: D().cats[0]?.n || "Reguler",
-      seats: 2,
-      amount: (D().cats[0]?.p || 0) * 2,
-      bank: D().methods[0]?.name || "BCA",
-      status: "verified",
-      note: "Transfer 08.41",
-      date: today(),
-      custom: {},
-    },
-    {
-      type: "donation",
-      name: "PT Nada Jaya",
-      phone: "",
-      cat: D().cats[0]?.n || "Reguler",
-      seats: 10,
-      amount: 25000000,
-      bank: D().methods[0]?.name || "BCA",
-      status: "pending",
-      note: "",
-      date: today(),
-      custom: {},
-    },
-    {
-      type: "expense",
-      name: "Sound System",
-      phone: "",
-      cat: "",
-      seats: 0,
-      amount: 7500000,
-      bank: D().methods[0]?.name || "BCA",
-      status: "verified",
-      note: "DP 50%",
-      date: today(),
-      custom: {},
-    },
-  ];
+  const cats = D().cats;
+  const cols = D().tpl;
+  const headers = uniqueHeaders(cols).map((h, i) =>
+    MANDATORY_FIELDS.includes(cols[i].f) && !h.endsWith("*") ? h + "*" : h,
+  );
   const ExcelJS = await loadExcelJS();
   const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet(id ? "Template" : "Template");
-  addReportTitle(ws, periodLabel(today(), "week"));
-  addTxTable(ws, ex, "TabelTemplate");
+  const ws = wb.addWorksheet("Template");
+  ws.addRow(headers);
+  styleHeaderRow(ws, 1);
+
+  const colLetter = (i) => String.fromCharCode(65 + i);
+  const dateIdx = cols.findIndex((c) => c.f === "date");
+  const catIdx = cols.findIndex((c) => c.f === "cat");
+  const noteIdx = cols.findIndex((c) => c.f === "note");
+  const note2Idx = cols.findIndex((c) => c.f === "note2");
+  const amountIdx = cols.findIndex((c) => c.f === "amount");
+  const statusIdx = cols.findIndex((c) => c.f === "status");
+  const bankIdx = cols.findIndex((c) => c.f === "bank");
+  const bankNameIdx = cols.findIndex((c) => c.f === "bankName");
+  const phoneIdx = cols.findIndex((c) => c.f === "phone");
+  const tieredCats = cats.filter((c) => c.tiers?.length);
+
+  const exCat = tieredCats[0] || cats.find((c) => c.group === "income" && !c.hasQty) || cats[0];
+  const exMethod = D().methods.find((m) => m.type === "bank") || D().methods[0];
+  const exampleNote = id ? "iuran bulan Juli" : "July dues";
+  const example = {
+    name: "Michael",
+    phone: "0812xxxxxxxx",
+    cat: exCat?.n || "",
+    note: exCat?.tiers?.length ? exCat.tiers[0].name : exampleNote,
+    note2: exCat?.tiers?.length ? 1 : exampleNote,
+    bank: exMethod?.name || "",
+    bankName: exMethod?.type === "bank" ? "BCA" : "",
+    status: t("stV"),
+  };
+  const row2 = ws.addRow(cols.map((c) => (c.custom || c.f === "date" || c.f === "amount" ? "" : (example[c.f] ?? ""))));
+  if (dateIdx >= 0) row2.getCell(dateIdx + 1).value = new Date(`${today()}T00:00:00`);
+  if (amountIdx >= 0) row2.getCell(amountIdx + 1).value = 1000000;
+
+  // tanggal HARUS dd/mm/yyyy: format tampilan kolom dipaksa dd/mm/yyyy +
+  // validasi tipe tanggal (menolak teks non-tanggal), bukan cuma contoh baris
+  if (dateIdx >= 0) {
+    const col = ws.getColumn(dateIdx + 1);
+    col.numFmt = "dd/mm/yyyy";
+    ws.dataValidations.add(`${colLetter(dateIdx)}2:${colLetter(dateIdx)}1000`, {
+      type: "date",
+      operator: "between",
+      formulae: [new Date(2000, 0, 1), new Date(2100, 11, 31)],
+      allowBlank: true,
+      showErrorMessage: true,
+      errorTitle: id ? "Format tanggal salah" : "Invalid date",
+      error: id
+        ? "Isi tanggal dgn format dd/mm/yyyy (gunakan date picker Excel)."
+        : "Enter a valid date in dd/mm/yyyy format (use Excel's date picker).",
+    });
+  }
+  // nominal ditampilkan sbg Rupiah begitu diisi (contoh: 1000000 -> Rp 1.000.000)
+  if (amountIdx >= 0) ws.getColumn(amountIdx + 1).numFmt = '"Rp "#,##0';
+  // no. whatsapp disimpan sbg teks supaya angka 0 di depan & digit panjang
+  // tidak diubah Excel jadi notasi ilmiah / kehilangan leading zero
+  if (phoneIdx >= 0) ws.getColumn(phoneIdx + 1).numFmt = "@";
+
+  // dropdown Excel utk kategori/status/metode pembayaran/bank, supaya user
+  // tinggal pilih drpd salah ketik (kategori yg dipilih menentukan pemasukan
+  // vs pengeluaran saat diimpor, lihat parseRows())
+  if (catIdx >= 0 && cats.length) {
+    const ref = wb.addWorksheet("_ref");
+    ref.state = "veryHidden";
+    cats.forEach((c, i) => (ref.getCell(i + 1, 1).value = c.n));
+    INDONESIA_BANKS.forEach((b, i) => (ref.getCell(i + 1, 2).value = b));
+    const tierNames = [...new Set(tieredCats.flatMap((c) => c.tiers.map((tr) => tr.name)))];
+    tierNames.forEach((n, i) => (ref.getCell(i + 1, 3).value = n));
+    ws.dataValidations.add(`${colLetter(catIdx)}2:${colLetter(catIdx)}1000`, {
+      type: "list",
+      allowBlank: false,
+      formulae: [`_ref!$A$1:$A$${cats.length}`],
+      showErrorMessage: true,
+      errorTitle: id ? "Kategori tidak dikenali" : "Unknown category",
+      error: id ? "Pilih kategori dari daftar dropdown." : "Choose a category from the dropdown list.",
+    });
+    if (bankNameIdx >= 0) {
+      ws.dataValidations.add(`${colLetter(bankNameIdx)}2:${colLetter(bankNameIdx)}1000`, {
+        type: "list",
+        allowBlank: true,
+        formulae: [`_ref!$B$1:$B$${INDONESIA_BANKS.length}`],
+      });
+      const note = ws.getCell(1, bankNameIdx + 1);
+      note.note = id
+        ? "Wajib diisi jika Metode Pembayaran = Transfer Bank."
+        : "Required only when Payment Method = Transfer Bank.";
+    }
+    // dropdown tingkat (Platinum/Gold/Silver) di kolom Keterangan hanya utk
+    // kategori bertingkat (mis. Pembelian Kursi) - bukan validasi keras (spy
+    // kategori lain masih bisa isi catatan bebas spt biasa), cuma kemudahan
+    if (tierNames.length && noteIdx >= 0) {
+      ws.dataValidations.add(`${colLetter(noteIdx)}2:${colLetter(noteIdx)}1000`, {
+        type: "list",
+        allowBlank: true,
+        showErrorMessage: false,
+        formulae: [`_ref!$C$1:$C$${tierNames.length}`],
+      });
+      const note = ws.getCell(1, noteIdx + 1);
+      note.note = id
+        ? `Untuk kategori bertingkat (${tieredCats.map((c) => c.n).join(", ")}): isi nama tingkat (${tierNames.join("/")}). Kategori lain: catatan bebas.`
+        : `For tiered categories (${tieredCats.map((c) => c.n).join(", ")}): enter the tier name (${tierNames.join("/")}). Other categories: free text.`;
+      if (note2Idx >= 0) {
+        const note2Cell = ws.getCell(1, note2Idx + 1);
+        note2Cell.note = id
+          ? `Untuk kategori bertingkat: isi jumlah kursi yang dibeli (angka). Kategori lain: catatan tambahan bebas.`
+          : `For tiered categories: enter the number of seats purchased. Other categories: free additional note.`;
+      }
+    }
+  }
+  if (statusIdx >= 0) {
+    ws.dataValidations.add(`${colLetter(statusIdx)}2:${colLetter(statusIdx)}1000`, {
+      type: "list",
+      allowBlank: false,
+      formulae: [`"${t("stV")},${t("stW")}"`],
+    });
+  }
+  if (bankIdx >= 0 && D().methods.length) {
+    ws.dataValidations.add(`${colLetter(bankIdx)}2:${colLetter(bankIdx)}1000`, {
+      type: "list",
+      allowBlank: false,
+      formulae: [`"${D().methods.map((m) => m.name).join(",")}"`],
+    });
+  }
+
+  cols.forEach((c, i) => {
+    ws.getColumn(i + 1).width = Math.max(
+      (headers[i] || "").length + 3,
+      c.f === "note" || c.f === "note2" ? 22 : c.f === "name" ? 18 : 14,
+    );
+  });
   await downloadWorkbook(wb, "Template-Import.xlsx");
   toast(t("dlTpl"));
 }
@@ -2971,6 +4283,22 @@ function readFile(file) {
   };
   r.readAsArrayBuffer(file);
 }
+// nama bulan Indonesia & Inggris (+ singkatan umum) - dipakai normDate() utk
+// mengenali tanggal spt "25 Juli 2026" yg tidak dikenali Date() bawaan JS
+const MONTH_NAMES = {
+  jan: 0, januari: 0, january: 0,
+  feb: 1, februari: 1, february: 1,
+  mar: 2, maret: 2, march: 2,
+  apr: 3, april: 3,
+  mei: 4, may: 4,
+  jun: 5, juni: 5, june: 5,
+  jul: 6, juli: 6, july: 6,
+  agu: 7, agt: 7, agustus: 7, aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8,
+  okt: 9, oktober: 9, oct: 9, october: 9,
+  nov: 10, november: 10,
+  des: 11, desember: 11, dec: 11, december: 11,
+};
 function normDate(v) {
   if (!v) return "";
   if (v instanceof Date) return v.toISOString().slice(0, 10);
@@ -2978,6 +4306,18 @@ function normDate(v) {
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
   let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
   if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  // "25 Juli 2026" / "25 July 2026" (juga terima "Juli 25, 2026")
+  m = s.match(/^(\d{1,2})\s+([a-zA-Z]+)\.?,?\s+(\d{4})$/);
+  if (!m) {
+    const m2 = s.match(/^([a-zA-Z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$/);
+    if (m2) m = [m2[0], m2[2], m2[1], m2[3]];
+  }
+  if (m) {
+    const mo = MONTH_NAMES[m[2].toLowerCase()];
+    if (mo !== undefined) {
+      return `${m[3]}-${String(mo + 1).padStart(2, "0")}-${String(+m[1]).padStart(2, "0")}`;
+    }
+  }
   if (/^\d+$/.test(s)) {
     const d = new Date(Date.UTC(1899, 11, 30) + +s * 864e5);
     return d.toISOString().slice(0, 10);
@@ -2985,11 +4325,12 @@ function normDate(v) {
   const d = new Date(s);
   return isNaN(d) ? "" : d.toISOString().slice(0, 10);
 }
+// dipakai cuma sbg fallback pas kategori di baris impor tidak dikenali -
+// jalur utama sekarang mencocokkan nama kategori ke config.cats (lihat parseRows)
 function normType(v) {
   const s = String(v || "").toLowerCase();
-  if (/don|invest/.test(s)) return "donation";
-  if (/exp|keluar|biaya|beban/.test(s)) return "expense";
-  return "ticket";
+  if (/exp|keluar|biaya|beban|pengeluaran/.test(s)) return "expense";
+  return "income";
 }
 function normNum(v) {
   return +String(v ?? "").replace(/[^\d.-]/g, "") || 0;
@@ -2999,12 +4340,16 @@ function normNum(v) {
 // cari baris mana yang paling cocok dengan nama kolom di D().tpl, jangan
 // asumsikan header selalu di baris pertama (juga tetap benar untuk file
 // polos yang headernya memang di baris pertama)
+// header di file yg diunduh dari app sendiri punya sufiks "*" utk kolom
+// wajib (lihat dlTemplate()) - abaikan sufiks itu saat mencocokkan header,
+// supaya cocok terlepas dari apakah tpl tersimpan sudah punya "*" atau belum
+const normHeader = (h) => String(h).trim().toLowerCase().replace(/\*\s*$/, "");
 function findHeaderRowIndex(rows) {
-  const tplHeaders = D().tpl.map((c) => String(c.h).trim().toLowerCase());
+  const tplHeaders = D().tpl.map((c) => normHeader(c.h));
   let bestIdx = 0,
     bestScore = -1;
   for (let i = 0; i < Math.min(rows.length, 10); i++) {
-    const row = (rows[i] || []).map((h) => String(h).trim().toLowerCase());
+    const row = (rows[i] || []).map((h) => normHeader(h));
     const score = row.filter((h) => tplHeaders.includes(h)).length;
     if (score > bestScore) {
       bestScore = score;
@@ -3018,10 +4363,10 @@ function parseRows(rows) {
   if (!rows || rows.length < 2)
     return (body.innerHTML = `<div class="empty">${t("noCol")}</div>`);
   const headerIdx = findHeaderRowIndex(rows);
-  const head = (rows[headerIdx] || []).map((h) => String(h).trim().toLowerCase()),
+  const head = (rows[headerIdx] || []).map((h) => normHeader(h)),
     idx = {};
   D().tpl.forEach((c) => {
-    const i = head.indexOf(String(c.h).trim().toLowerCase());
+    const i = head.indexOf(normHeader(c.h));
     if (i >= 0) idx[c.f] = i;
   });
   if (
@@ -3037,22 +4382,54 @@ function parseRows(rows) {
   let bad = 0;
   rows.slice(headerIdx + 1).forEach((r) => {
     if (!r || !r.length || r.every((c) => String(c).trim() === "")) return;
+    const nameRaw = String(get(r, "name") || "").trim();
+    const rawCat = String(get(r, "cat") || "").trim();
+    const bankRaw = String(get(r, "bank") || "").trim();
+    const bankNameRaw = String(get(r, "bankName") || "").trim();
+    const statusRaw = String(get(r, "status") || "").trim();
     const debit = normNum(get(r, "debit")),
       credit = normNum(get(r, "credit")),
       legacyAmt = normNum(get(r, "amount")),
       amt = debit || credit || legacyAmt,
-      dt = normDate(get(r, "date")) || today();
-    if (!amt) {
+      dt = normDate(get(r, "date"));
+    // utamakan grup kategori yg sudah dikenal (config.cats) drpd teks kolom
+    // "type" - sumber kebenaran skrg ada di kategori, bukan lagi ticket/
+    // donation/expense; teks "type" cuma fallback kalau kategorinya tak dikenal
+    const matchedCat = D().cats.find((c) => c.n.toLowerCase() === rawCat.toLowerCase());
+    const matchedMethod = D().methods.find((m) => m.name.toLowerCase() === bankRaw.toLowerCase());
+    // kolom Bank cuma wajib kalau metode pembayarannya "bank" (transfer) -
+    // utk Tunai/Utang/Cek kosong itu wajar, jadi tidak dianggap baris rusak
+    const bankNameMissing = matchedMethod?.type === "bank" && !bankNameRaw;
+    // kolom wajib (lihat MANDATORY_FIELDS): tanggal, nama, kategori (harus
+    // cocok dgn kategori yg ada), nominal, metode pembayaran (harus cocok),
+    // status - baris yg kosong/tak dikenali di salah satunya dilewati
+    if (!dt || !nameRaw || !matchedCat || !amt || !matchedMethod || !statusRaw || bankNameMissing) {
       bad++;
       return;
     }
-    let ty = normType(get(r, "type"));
-    if (!String(get(r, "type") || "").trim() && credit && !debit) ty = "expense";
-    const st = /masuk|verif|lunas|received|paid|ok/i.test(
-      String(get(r, "status")),
-    )
-      ? "verified"
-      : "pending";
+    const ty = matchedCat.group;
+    const st = /masuk|verif|lunas|received|paid|ok/i.test(statusRaw) ? "verified" : "pending";
+    const matchedBankName = matchedMethod.type === "bank"
+      ? INDONESIA_BANKS.find((b) => b.toLowerCase() === bankNameRaw.toLowerCase()) || bankNameRaw
+      : "";
+    // kategori bertingkat (mis. Pembelian Kursi): kolom Keterangan berisi nama
+    // tingkat & Keterangan Tambahan berisi jumlah kursi, bukan catatan bebas -
+    // lihat hint di dlTemplate()
+    const noteRaw = String(get(r, "note") || "");
+    const note2Raw = String(get(r, "note2") || "");
+    let tier = "", seats = 0, note = noteRaw, note2 = note2Raw;
+    if (matchedCat.tiers?.length) {
+      const matchedTier = matchedCat.tiers.find((tr) => tr.name.toLowerCase() === noteRaw.trim().toLowerCase());
+      tier = matchedTier?.name || "";
+      seats = normNum(note2Raw);
+      note = "";
+      note2 = "";
+    } else if (matchedCat.hasQty) {
+      // kategori hasQty TANPA tingkat (mis. tpl lama dgn kolom "Kursi"
+      // terpisah) - jumlah kursinya tetap dibaca dari kolom generik "seats",
+      // bukan dari Keterangan Tambahan (yg cuma dipakai utk kategori bertingkat)
+      seats = normNum(get(r, "seats"));
+    }
     const custom = {};
     customCols.forEach((c) => {
       custom[c.f] = String(get(r, c.f) || "");
@@ -3061,33 +4438,27 @@ function parseRows(rows) {
       id: uid(),
       type: ty,
       date: dt,
-      name: String(get(r, "name") || "—").trim(),
+      name: nameRaw || "—",
       phone: String(get(r, "phone") || ""),
-      cat: String(
-        get(r, "cat") || (ty === "expense" ? "" : D().cats[0]?.n || ""),
-      ),
-      seats: ty === "expense" ? 0 : normNum(get(r, "seats")),
+      cat: matchedCat.n,
+      tier,
+      seats,
       amount: amt,
-      bank: String(get(r, "bank") || D().methods[0]?.name || ""),
-      methodType:
-        D().methods.find((m) => m.name === String(get(r, "bank") || ""))?.type ||
-        "bank",
-      cashBreakdown: {},
+      bank: matchedMethod.name,
+      bankName: matchedBankName,
+      methodType: matchedMethod.type,
       chequeNo: "",
       chequeBank: "",
       chequeDate: "",
-      note: String(get(r, "note") || ""),
+      note,
+      note2,
       proof: "",
       status: st,
       by: acting().name,
       custom,
     });
   });
-  const lbl = {
-    ticket: t("seatsW"),
-    donation: t("donW"),
-    expense: t("expW"),
-  };
+  const lbl = { income: t("incomeW"), expense: t("expW") };
   body.innerHTML = `<div style="margin-top:12px"><div class="rowsp"><span class="label">${t("prev")}</span>
     <span class="hint">${t("rowsOk", { n: pendingImp.length })}${bad ? " · " + t("rowsBad", { n: bad }) : ""}</span></div>
     <div class="scroll" style="max-height:230px;border:1px solid var(--line);border-radius:10px;margin-top:6px;padding:0 10px">
@@ -3097,7 +4468,7 @@ function parseRows(rows) {
         (
           x,
         ) => `<tr><td class="mono hint">${x.date.slice(5)}</td><td style="font-weight:600">${esc(x.name)}</td>
-      <td>${lbl[x.type]} ${esc(x.cat)} ${x.seats ? "· " + x.seats : ""}</td>
+      <td>${lbl[x.type]} ${esc(catLabel(x))} ${x.seats ? "· " + x.seats : ""}</td>
       <td class="mono" style="text-align:right">${rp(x.amount)}</td></tr>`,
       )
       .join("")}</tbody></table></div>
@@ -3158,96 +4529,197 @@ async function doExportExcel() {
   closeSheet();
   await exportExcel(kind, refDate);
 }
-function buildSummarySheet(wb, s, kind, refDate) {
-  const id = lang === "id";
-  const ws = wb.addWorksheet(id ? "Ringkasan" : "Summary");
-  ws.addRows([
-    [id ? "LAPORAN KEUANGAN" : "FINANCIAL REPORT", D().event],
-    [t("evDate"), D().date || "-"],
-    [id ? "Periode" : "Period", periodLabel(refDate, kind)],
-    [id ? "Dicetak" : "Generated", new Date().toLocaleString()],
-    [id ? "Oleh" : "By", acting().name + " (" + acting().email + ")"],
-    [],
-    [t("ticket"), s.inTicket],
-    [t("don"), s.inDon],
-    [id ? "Total pemasukan" : "Total income", s.inTicket + s.inDon],
-    [t("exp"), s.exp],
-    [t("net"), s.net],
-    [],
-    [t("wait"), s.pendAmt],
-    [],
-    [t("quota"), s.quota],
-    [id ? "Kursi terjual" : "Seats sold", s.sold],
-    [id ? "Kursi dipesan belum lunas" : "Seats reserved unpaid", s.held],
-    [id ? "Kursi tersedia" : "Seats available", s.avail],
-  ]);
-  ws.getColumn(1).width = 28;
-  ws.getColumn(1).font = { bold: true };
-  ws.getColumn(2).width = 30;
+// laporan-laporan di bawah ini dibuat spt neraca sederhana (bagian
+// berjudul, item diindentasi, baris total bergaris atas) - bukan tabel
+// transaksi mentah. Urutan sheet: (1) keseluruhan, (2) penerimaan, (3)
+// pengeluaran, (4+) satu sheet per kategori, terakhir tabel transaksi mentah
+// sbg referensi tambahan.
+function moneyCell(ws, row, col, value) {
+  const cell = ws.getCell(row, col);
+  cell.value = value;
+  cell.numFmt = "#,##0";
+  return cell;
 }
-function buildSeatsSheet(wb) {
+function statementHeader(ws, subtitle, spanCols = 3) {
+  ws.mergeCells(1, 1, 1, spanCols);
+  const c1 = ws.getCell(1, 1);
+  c1.value = lang === "id" ? "LAPORAN KEUANGAN" : "FINANCIAL STATEMENT";
+  c1.font = { bold: true, size: 15 };
+  c1.alignment = { horizontal: "center" };
+  ws.mergeCells(2, 1, 2, spanCols);
+  const c2 = ws.getCell(2, 1);
+  c2.value = D().event;
+  c2.font = { bold: true, size: 12 };
+  c2.alignment = { horizontal: "center" };
+  ws.mergeCells(3, 1, 3, spanCols);
+  const c3 = ws.getCell(3, 1);
+  c3.value = subtitle;
+  c3.font = { size: 10, color: { argb: "FF6B6B66" } };
+  c3.alignment = { horizontal: "center" };
+  ws.getRow(1).height = 22;
+  return 5;
+}
+const topBorder = (ws, row, style = "thin") =>
+  ws.getRow(row).eachCell({ includeEmpty: true }, (cell) => (cell.border = { top: { style } }));
+function catAmount(c, kind, refDate) {
+  return S.tx
+    .filter((x) => x.status === "verified" && x.cat === c.n && txInPeriod(x, kind, refDate))
+    .reduce((a, b) => a + b.amount, 0);
+}
+function uniqueSheetName(base, usedNames) {
+  const clean = String(base).replace(/[\\/?*[\]:]/g, "-").slice(0, 28) || "Sheet";
+  let name = clean,
+    n = 1;
+  while (usedNames.has(name.toLowerCase())) name = `${clean.slice(0, 24)} (${++n})`;
+  usedNames.add(name.toLowerCase());
+  return name;
+}
+function buildOverallSheet(wb, kind, refDate, usedNames) {
   const id = lang === "id";
-  const ws = wb.addWorksheet(id ? "Kursi" : "Seats");
-  ws.addRow([
-    t("catTitle"), t("price"), t("quota"),
-    id ? "Terjual" : "Sold", id ? "Sisa" : "Left", id ? "Nilai" : "Value",
-  ]);
-  styleHeaderRow(ws, 1);
-  D().cats.forEach((c) => {
-    const sd = S.tx
-      .filter((x) => x.status === "verified" && x.cat === c.n)
-      .reduce((a, b) => a + (+b.seats || 0), 0);
-    ws.addRow([c.n, c.p, c.q, sd, c.q - sd, sd * c.p]);
+  const ws = wb.addWorksheet(uniqueSheetName(id ? "Laporan Keseluruhan" : "Overall Report", usedNames));
+  let row = statementHeader(ws, periodLabel(refDate, kind));
+  ws.mergeCells(row, 1, row, 3);
+  ws.getCell(row, 1).value =
+    (id ? "Dicetak" : "Generated") + ": " + new Date().toLocaleString() + " · " + (id ? "Oleh" : "By") + ": " + acting().name;
+  ws.getCell(row, 1).font = { size: 9, italic: true, color: { argb: "FF9A9A93" } };
+  row += 2;
+
+  const incomeCats = D().cats.filter((c) => c.group === "income");
+  const expenseCats = D().cats.filter((c) => c.group === "expense");
+
+  ws.getCell(row, 1).value = t("incomeW").toUpperCase();
+  ws.getCell(row, 1).font = { bold: true, size: 12 };
+  row++;
+  let incomeTotal = 0;
+  incomeCats.forEach((c) => {
+    const v = catAmount(c, kind, refDate);
+    incomeTotal += v;
+    ws.getCell(row, 1).value = "    " + c.n;
+    moneyCell(ws, row, 3, v);
+    row++;
   });
-  ws.columns.forEach((c) => (c.width = 16));
+  ws.getCell(row, 1).value = id ? "Total Penerimaan" : "Total Income";
+  ws.getCell(row, 1).font = { bold: true };
+  moneyCell(ws, row, 3, incomeTotal).font = { bold: true };
+  topBorder(ws, row);
+  row += 2;
+
+  ws.getCell(row, 1).value = t("exp").toUpperCase();
+  ws.getCell(row, 1).font = { bold: true, size: 12 };
+  row++;
+  let expenseTotal = 0;
+  expenseCats.forEach((c) => {
+    const v = catAmount(c, kind, refDate);
+    expenseTotal += v;
+    ws.getCell(row, 1).value = "    " + c.n;
+    moneyCell(ws, row, 3, v);
+    row++;
+  });
+  ws.getCell(row, 1).value = id ? "Total Pengeluaran" : "Total Expense";
+  ws.getCell(row, 1).font = { bold: true };
+  moneyCell(ws, row, 3, expenseTotal).font = { bold: true };
+  topBorder(ws, row);
+  row += 2;
+
+  ws.getCell(row, 1).value = t("net").toUpperCase();
+  ws.getCell(row, 1).font = { bold: true, size: 13 };
+  moneyCell(ws, row, 3, incomeTotal - expenseTotal).font = { bold: true, size: 13 };
+  topBorder(ws, row, "double");
+
+  ws.getColumn(1).width = 36;
+  ws.getColumn(2).width = 4;
+  ws.getColumn(3).width = 20;
 }
-function buildTrendSheet(wb) {
+function buildGroupSheet(wb, group, kind, refDate, usedNames) {
   const id = lang === "id";
-  const ws = wb.addWorksheet(id ? "Tren Harian" : "Daily Trend");
-  ws.addRow([t("date"), id ? "Pemasukan" : "Income"]);
-  styleHeaderRow(ws, 1);
-  seriesByDay(30).forEach((x) => ws.addRow([x.k, x.v]));
-  ws.columns.forEach((c) => (c.width = 16));
+  const label = group === "income" ? t("incomeW") : t("exp");
+  const ws = wb.addWorksheet(uniqueSheetName(label, usedNames));
+  let row = statementHeader(ws, label + " · " + periodLabel(refDate, kind));
+  const cats = D().cats.filter((c) => c.group === group);
+  ws.getCell(row, 1).value = t("txCat");
+  ws.getCell(row, 2).value = id ? "Jml. Transaksi" : "Transactions";
+  ws.getCell(row, 3).value = id ? "Total" : "Total";
+  styleHeaderRow(ws, row);
+  row++;
+  let grand = 0,
+    grandN = 0;
+  cats.forEach((c) => {
+    const tx = S.tx.filter((x) => x.status === "verified" && x.cat === c.n && txInPeriod(x, kind, refDate));
+    const v = tx.reduce((a, b) => a + b.amount, 0);
+    grand += v;
+    grandN += tx.length;
+    ws.getCell(row, 1).value = c.n;
+    ws.getCell(row, 2).value = tx.length;
+    moneyCell(ws, row, 3, v);
+    row++;
+  });
+  ws.getCell(row, 1).value = id ? `Total ${label}` : `Total ${label}`;
+  ws.getCell(row, 1).font = { bold: true };
+  ws.getCell(row, 2).value = grandN;
+  ws.getCell(row, 2).font = { bold: true };
+  moneyCell(ws, row, 3, grand).font = { bold: true };
+  topBorder(ws, row);
+  ws.getColumn(1).width = 32;
+  ws.getColumn(2).width = 16;
+  ws.getColumn(3).width = 18;
 }
-function buildRankSheet(wb) {
+function buildCategorySheet(wb, cat, usedNames, kind, refDate) {
   const id = lang === "id";
-  const ws = wb.addWorksheet(id ? "Peringkat" : "Rankings");
-  ws.addRow([t("topBuy")]);
-  ws.getCell(1, 1).font = { bold: true, size: 13 };
-  ws.addRow([t("name"), t("trans"), t("seatsW"), "Total"]);
-  styleHeaderRow(ws, 2);
-  byPerson("ticket").forEach((x) => ws.addRow([x.name, x.n, x.seats, x.amount]));
-  ws.addRow([]);
-  const r2 = ws.rowCount + 1;
-  ws.addRow([t("topDon")]);
-  ws.getCell(r2, 1).font = { bold: true, size: 13 };
-  ws.addRow([t("name"), t("trans"), t("seatsW"), "Total"]);
-  styleHeaderRow(ws, r2 + 1);
-  byPerson("donation").forEach((x) => ws.addRow([x.name, x.n, x.seats, x.amount]));
-  ws.columns.forEach((c) => (c.width = 20));
+  const ws = wb.addWorksheet(uniqueSheetName(cat.n, usedNames));
+  let row = statementHeader(ws, cat.n + " · " + periodLabel(refDate, kind), 6);
+  const tx = S.tx
+    .filter((x) => x.status === "verified" && x.cat === cat.n && txInPeriod(x, kind, refDate))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  [t("date"), t("name"), t("note"), t("paymentMethod"), t("status"), t("amount")].forEach(
+    (h, i) => (ws.getCell(row, i + 1).value = h),
+  );
+  styleHeaderRow(ws, row);
+  row++;
+  let total = 0;
+  tx.forEach((x) => {
+    ws.getCell(row, 1).value = x.date;
+    ws.getCell(row, 2).value = x.name;
+    ws.getCell(row, 3).value = x.tier ? `${x.note || ""} (${x.tier})`.trim() : x.note || "";
+    ws.getCell(row, 4).value = x.bank + (x.bankName ? " - " + x.bankName : "");
+    ws.getCell(row, 5).value = t("inRek");
+    moneyCell(ws, row, 6, x.amount);
+    total += x.amount;
+    row++;
+  });
+  if (!tx.length) {
+    ws.getCell(row, 1).value = t("noneYet");
+    ws.getCell(row, 1).font = { italic: true, color: { argb: "FF9A9A93" } };
+    row++;
+  }
+  ws.getCell(row, 5).value = id ? "Total" : "Total";
+  ws.getCell(row, 5).font = { bold: true };
+  moneyCell(ws, row, 6, total).font = { bold: true };
+  topBorder(ws, row);
+  const widths = [14, 20, 26, 20, 12, 16];
+  ws.columns.forEach((c, i) => (c.width = widths[i] || 16));
 }
 async function exportExcel(kind, refDate) {
-  const s = sums(),
-    id = lang === "id";
+  const id = lang === "id";
   const ExcelJS = await loadExcelJS();
   const wb = new ExcelJS.Workbook();
   wb.creator = "Kas Acara";
+  const usedNames = new Set();
+  buildOverallSheet(wb, kind, refDate, usedNames);
+  buildGroupSheet(wb, "income", kind, refDate, usedNames);
+  buildGroupSheet(wb, "expense", kind, refDate, usedNames);
+  D().cats.forEach((c) => buildCategorySheet(wb, c, usedNames, kind, refDate));
   const txRows = S.tx
     .filter((x) => txInPeriod(x, kind, refDate))
     .slice()
     .sort((a, b) => a.date.localeCompare(b.date));
-  const wsTx = wb.addWorksheet(id ? "Transaksi" : "Transactions");
+  const wsTx = wb.addWorksheet(uniqueSheetName(id ? "Transaksi" : "Transactions", usedNames));
   addReportTitle(wsTx, periodLabel(refDate, kind));
   addTxTable(wsTx, txRows, "TabelTransaksi");
-  buildSummarySheet(wb, s, kind, refDate);
-  buildSeatsSheet(wb);
-  buildTrendSheet(wb);
-  buildRankSheet(wb);
   await downloadWorkbook(
     wb,
     `${id ? "Laporan" : "Report"}-${(D().event || "Acara").replace(/\s+/g, "-")}-${refDate || today()}.xlsx`,
   );
-  await mutate(() => {}, "actExport", D().event + " · " + rp(s.net));
+  await mutate(() => {}, "actExport", D().event + " · " + rp(sums().net));
   toast(t("xls"));
 }
 Object.assign(window, {
@@ -3284,7 +4756,17 @@ Object.assign(window, {
   saveTx,
   delTx,
   verify,
-  setType,
+  onCatChange,
+  setTxTab,
+  onTierChange,
+  openTierManager,
+  addTier,
+  editTier,
+  delTier,
+  addBonusRule,
+  editBonusRule,
+  delBonusRule,
+  updateBonusHint,
   recalc,
   stepSeats,
   prev,
@@ -3310,6 +4792,19 @@ Object.assign(window, {
   createEventSubmit,
   toggleArchive,
   loadMonitor,
+  goDashEditor,
+  openWidgetForm,
+  onWidgetTypeChange,
+  onWidgetGroupChange,
+  drilldownKpi,
+  drilldownCat,
+  drilldownPerson,
+  drilldownDate,
+  onDrillSearch,
+  setDrillPage,
+  submitWidgetForm,
+  deleteDashWidget,
+  saveDashLayout,
   saveSet,
   editCat,
   editTpl,
@@ -3321,7 +4816,6 @@ Object.assign(window, {
   editMethod,
   delMethod,
   onMethodChange,
-  recalcCash,
   resetAll,
   openExportPeriod,
   setExportKind,
