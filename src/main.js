@@ -1089,6 +1089,8 @@ const L = {
     tableLbl: "Meja",
     seatNosLbl: "Nomor Kursi",
     seatNosPlaceholder: "cth: A,C,E",
+    seatsAtTablesLbl: "Kursi per Meja",
+    addAnotherTable: "+ Tambah Meja",
     seatsTakenHint: "Kursi terisi: {list}",
     seatsAllFreeHint: "Semua kursi tersedia",
   },
@@ -1458,6 +1460,8 @@ const L = {
     tableLbl: "Table",
     seatNosLbl: "Seat Numbers",
     seatNosPlaceholder: "e.g. A,C,E",
+    seatsAtTablesLbl: "Seats per Table",
+    addAnotherTable: "+ Add Table",
     seatsTakenHint: "Taken seats: {list}",
     seatsAllFreeHint: "All seats available",
   },
@@ -4527,10 +4531,10 @@ function openTx(id) {
           <button type="button" class="step-btn" onclick="stepSeats(1)" aria-label="+">+</button>
         </div></div>
     </div>
-    <div class="grid" id="w_seatPick" style="display:none;grid-template-columns:1fr 1fr;margin-bottom:14px">
-      <div class="field"><label>${t("tableLbl")} <span class="req">*</span></label><select id="f_table" onchange="onSeatPickTableChange()"></select></div>
-      <div class="field"><label>${t("seatNosLbl")} <span class="req">*</span></label><input id="f_seatNos" placeholder="${t("seatNosPlaceholder")}" oninput="onSeatNosInput()">
-        <div class="hint" id="seatAvailHint" style="margin-top:4px"></div></div>
+    <div class="field" id="w_seatPick" style="display:none;margin-bottom:14px">
+      <label>${t("seatsAtTablesLbl")} <span class="req">*</span></label>
+      <div id="seatGroupsWrap"></div>
+      <button type="button" class="btn ghost sm" onclick="addSeatGroupRow()">${t("addAnotherTable")}</button>
     </div>
     <div class="grid" id="w_cheque" style="display:none;grid-template-columns:1fr 1fr 1fr">
       <div class="field"><label>${t("chequeNo")}</label><input id="f_chequeNo" value="${esc(x.chequeNo || "")}"></div>
@@ -4758,50 +4762,108 @@ function onTierChange() {
 // terhubung ke seatIds & memengaruhi status kursi di denah. Return true
 // kalau mode ini aktif (dipakai onCatChange/onTierChange spy tidak dobel
 // menghitung ulang nominal lewat recalc() versi lama).
-function refreshSeatPickUI(init, x) {
+// kategori yg dipakai 1+ meja utk kategori+tingkat yg SEDANG dipilih di form
+function currentSeatTablesForForm() {
   const opt = document.getElementById("f_cat")?.selectedOptions[0];
   const catId = opt?.dataset.id;
   const tierWrap = document.getElementById("w_tier");
   const tierName = tierWrap.style.display !== "none" ? document.getElementById("f_tier")?.value : "";
-  const tables = catId ? catSeatTables(catId, tierName) : [];
+  return catId ? catSeatTables(catId, tierName) : [];
+}
+// 1 transaksi bisa mencakup kursi di BEBERAPA meja berbeda sekaligus (mis.
+// serombongan beli kursi terpisah - sebagian di meja 21, sebagian di meja
+// 13) - jadi bukan 1 pasang Meja+Nomor Kursi tetap, tapi daftar baris yg
+// bisa ditambah/dihapus, masing2 py meja & nomor kursinya sendiri. id tiap
+// elemen input diberi akhiran indeks (naik terus, tidak dipakai ulang
+// meski barisnya dihapus) spy selalu unik dlm satu sesi form.
+let seatGroupCounter = 0;
+function seatGroupRowHtml(idx, tables, selectedTableId, seatNosVal) {
+  return `<div class="seat-group-row" data-idx="${idx}" style="margin-bottom:10px;padding:10px;border:1px solid var(--line);border-radius:10px">
+    <div class="grid" style="grid-template-columns:1fr 1fr auto;gap:8px;align-items:end">
+      <div class="field" style="margin:0"><label>${t("tableLbl")}</label><select id="sg_table_${idx}" onchange="onSeatGroupChange()">
+        ${tables.map((tb) => `<option value="${tb.id}" ${tb.id === selectedTableId ? "selected" : ""}>${esc(tableLabel(tb))}${tb.locked ? ` (${t("tableLocked")})` : ""}</option>`).join("")}
+      </select></div>
+      <div class="field" style="margin:0"><label>${t("seatNosLbl")}</label><input id="sg_seatNos_${idx}" value="${esc(seatNosVal || "")}" placeholder="${t("seatNosPlaceholder")}" oninput="onSeatGroupChange()"></div>
+      <button type="button" class="btn ghost sm icon" onclick="removeSeatGroupRow(${idx})" aria-label="${t("del")}" title="${t("del")}">${closeIcon}</button>
+    </div>
+    <div class="hint" id="sg_hint_${idx}" style="margin-top:6px"></div>
+  </div>`;
+}
+function refreshSeatPickUI(init, x) {
+  const tables = currentSeatTablesForForm();
   const wrap = document.getElementById("w_seatPick");
   if (!tables.length) {
     wrap.style.display = "none";
     return false;
   }
   document.getElementById("w_seats").style.display = "none";
-  wrap.style.display = "grid";
-  const tableSel = document.getElementById("f_table");
-  const wantTableId = init && x?.seatIds?.length ? x.seatIds[0].split(":")[0] : tableSel.value;
-  tableSel.innerHTML = tables
-    .map((tb) => `<option value="${tb.id}">${esc(tableLabel(tb))}${tb.locked ? ` (${t("tableLocked")})` : ""}</option>`)
-    .join("");
-  tableSel.value = tables.some((tb) => tb.id === wantTableId) ? wantTableId : tables[0].id;
-  document.getElementById("f_seatNos").value = init && x?.seatIds?.length ? x.seatIds.map((sid) => seatLetter(+sid.split(":")[1])).join(",") : "";
-  onSeatPickTableChange();
+  wrap.style.display = "block";
+  seatGroupCounter = 0;
+  let rowsHtml = "";
+  if (init && x?.seatIds?.length) {
+    const byTable = new Map();
+    x.seatIds.forEach((sid) => {
+      const [tid, idx] = sid.split(":");
+      if (!byTable.has(tid)) byTable.set(tid, []);
+      byTable.get(tid).push(+idx);
+    });
+    for (const [tid, idxs] of byTable) {
+      const letters = idxs
+        .sort((a, b) => a - b)
+        .map(seatLetter)
+        .join(",");
+      rowsHtml += seatGroupRowHtml(seatGroupCounter++, tables, tid, letters);
+    }
+  } else {
+    rowsHtml = seatGroupRowHtml(seatGroupCounter++, tables, tables[0].id, "");
+  }
+  document.getElementById("seatGroupsWrap").innerHTML = rowsHtml;
+  refreshSeatGroupHints();
   return true;
 }
-function onSeatPickTableChange() {
-  const tb = findTable(document.getElementById("f_table")?.value);
-  const hintEl = document.getElementById("seatAvailHint");
-  if (!tb) {
-    hintEl.textContent = "";
-    return;
-  }
-  const myId = val("f_id");
-  const taken = [];
-  for (let i = 0; i < tb.seats; i++) {
-    const owner = txForSeat(seatId(tb.id, i));
-    if (owner && owner.id !== myId) taken.push(seatLetter(i));
-  }
-  hintEl.textContent = taken.length ? t("seatsTakenHint", { list: taken.join(", ") }) : t("seatsAllFreeHint");
-  onSeatNosInput();
+function addSeatGroupRow() {
+  const tables = currentSeatTablesForForm();
+  if (!tables.length) return;
+  document
+    .getElementById("seatGroupsWrap")
+    .insertAdjacentHTML("beforeend", seatGroupRowHtml(seatGroupCounter++, tables, tables[0].id, ""));
+  refreshSeatGroupHints();
 }
-function onSeatNosInput() {
-  const tb = findTable(document.getElementById("f_table")?.value);
-  if (!tb) return;
-  const nos = parseSeatNos(val("f_seatNos"));
-  document.getElementById("f_amount").value = nos.length * tablePrice(tb);
+function removeSeatGroupRow(idx) {
+  const rows = document.querySelectorAll("#seatGroupsWrap .seat-group-row");
+  if (rows.length <= 1) return; // sisakan minimal 1 baris spy form tetap bisa diisi
+  document.querySelector(`.seat-group-row[data-idx="${idx}"]`)?.remove();
+  refreshSeatGroupHints();
+}
+function onSeatGroupChange() {
+  refreshSeatGroupHints();
+}
+// hitung ulang hint "kursi terisi" PER baris + total nominal GABUNGAN
+// semua baris (tiap meja bisa beda harga kalau meja & tingkatnya beda,
+// meski dlm 1 transaksi tingkatnya sama - harga tetap dihitung per meja
+// spy konsisten kalau nanti ada pengecualian harga per meja)
+function refreshSeatGroupHints() {
+  const rows = document.querySelectorAll("#seatGroupsWrap .seat-group-row");
+  const myId = val("f_id");
+  let totalAmount = 0;
+  rows.forEach((row) => {
+    const idx = row.dataset.idx;
+    const tb = findTable(document.getElementById(`sg_table_${idx}`)?.value);
+    const hintEl = document.getElementById(`sg_hint_${idx}`);
+    if (!tb) {
+      hintEl.textContent = "";
+      return;
+    }
+    const taken = [];
+    for (let i = 0; i < tb.seats; i++) {
+      const owner = txForSeat(seatId(tb.id, i));
+      if (owner && owner.id !== myId) taken.push(seatLetter(i));
+    }
+    hintEl.textContent = taken.length ? t("seatsTakenHint", { list: taken.join(", ") }) : t("seatsAllFreeHint");
+    const nos = parseSeatNos(val(`sg_seatNos_${idx}`));
+    totalAmount += nos.length * tablePrice(tb);
+  });
+  document.getElementById("f_amount").value = totalAmount;
   prev();
 }
 function seatNosValid(tb, nos, myId) {
@@ -4973,9 +5035,30 @@ function invalidTxFields() {
   if (!(+g("amount") > 0)) bad.push("f_amount");
   const seatPickWrap = document.getElementById("w_seatPick");
   if (seatPickWrap && seatPickWrap.style.display !== "none") {
-    const tb = findTable(g("table"));
-    const nos = parseSeatNos(g("seatNos"));
-    if (!seatNosValid(tb, nos, g("id"))) bad.push("f_seatNos");
+    const rows = document.querySelectorAll("#seatGroupsWrap .seat-group-row");
+    const seenSeatIds = new Set();
+    let hasAnySeat = false;
+    rows.forEach((row) => {
+      const idx = row.dataset.idx;
+      const tb = findTable(document.getElementById(`sg_table_${idx}`)?.value);
+      const nos = parseSeatNos(document.getElementById(`sg_seatNos_${idx}`)?.value);
+      if (nos.length) hasAnySeat = true;
+      let rowBad = !seatNosValid(tb, nos, g("id"));
+      // cegah kursi yg SAMA dipilih dobel lintas baris (mis. meja yg sama
+      // dipilih di 2 baris, nomor kursinya tumpang tindih)
+      if (!rowBad && tb) {
+        for (const n of nos) {
+          const sid = seatId(tb.id, n);
+          if (seenSeatIds.has(sid)) {
+            rowBad = true;
+            break;
+          }
+          seenSeatIds.add(sid);
+        }
+      }
+      if (rowBad) bad.push(`sg_seatNos_${idx}`);
+    });
+    if (!hasAnySeat && rows.length) bad.push(`sg_seatNos_${rows[0].dataset.idx}`);
   }
   return bad;
 }
@@ -5000,10 +5083,13 @@ async function saveTx() {
   const seatPickActive = seatPickWrap && seatPickWrap.style.display !== "none";
   let seatIds, seats = hasQty ? +g("seats") || 0 : 0;
   if (seatPickActive) {
-    const tb = findTable(g("table"));
-    seatIds = parseSeatNos(g("seatNos"))
-      .sort((a, b) => a - b)
-      .map((n) => seatId(tb.id, n));
+    seatIds = [];
+    document.querySelectorAll("#seatGroupsWrap .seat-group-row").forEach((row) => {
+      const idx = row.dataset.idx;
+      const tb = findTable(document.getElementById(`sg_table_${idx}`)?.value);
+      const nos = parseSeatNos(document.getElementById(`sg_seatNos_${idx}`)?.value).sort((a, b) => a - b);
+      nos.forEach((n) => seatIds.push(seatId(tb.id, n)));
+    });
     seats = seatIds.length;
   }
   const x = {
@@ -5770,18 +5856,40 @@ function cellValue(x, c, no) {
   if (c.f === "no") return no;
   if (c.f === "type") return { income: t("incomeW"), expense: t("expW") }[x.type];
   if (c.f === "cat") return catLabel(x);
+  // 1 transaksi bisa mencakup kursi lintas BEBERAPA meja (lihat
+  // seatGroupsWrap di form) - kelompokkan per meja spy kolom Meja/Nomor
+  // Kursi tetap jelas menunjukkan kursi mana milik meja mana
+  const seatsByTable = () => {
+    const m = new Map();
+    (x.seatIds || []).forEach((sid) => {
+      const [tid, idx] = sid.split(":");
+      if (!m.has(tid)) m.set(tid, []);
+      m.get(tid).push(+idx);
+    });
+    return m;
+  };
   if (c.f === "table") {
-    const tb = x.seatIds?.length ? findTable(x.seatIds[0].split(":")[0]) : null;
-    return tb ? tableLabel(tb) : "";
+    const m = seatsByTable();
+    if (!m.size) return "";
+    return [...m.keys()]
+      .map((tid) => findTable(tid))
+      .filter(Boolean)
+      .map(tableLabel)
+      .join(", ");
   }
-  if (c.f === "seatNos")
-    return x.seatIds?.length
-      ? x.seatIds
-          .map((sid) => +sid.split(":")[1])
-          .sort((a, b) => a - b)
-          .map(seatLetter)
-          .join(", ")
-      : "";
+  if (c.f === "seatNos") {
+    const m = seatsByTable();
+    if (!m.size) return "";
+    const letters = (idxs) => idxs.sort((a, b) => a - b).map(seatLetter).join(", ");
+    if (m.size === 1) return letters([...m.values()][0]);
+    // lintas beberapa meja - tandai per meja spy tak ambigu (mis. "21: J; 13: A, B, C")
+    return [...m.entries()]
+      .map(([tid, idxs]) => {
+        const tb = findTable(tid);
+        return `${tb ? tableLabel(tb) : "?"}: ${letters(idxs)}`;
+      })
+      .join("; ");
+  }
   if (c.f === "debit") return x.type === "expense" ? null : x.amount;
   if (c.f === "credit") return x.type === "expense" ? x.amount : null;
   if (c.f === "status") return x.status === "verified" ? t("inRek") : t("stW");
@@ -6581,8 +6689,9 @@ Object.assign(window, {
   updateBonusHint,
   recalc,
   stepSeats,
-  onSeatPickTableChange,
-  onSeatNosInput,
+  addSeatGroupRow,
+  removeSeatGroupRow,
+  onSeatGroupChange,
   prev,
   onProofChange,
   viewProof,
