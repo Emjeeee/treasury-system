@@ -4053,14 +4053,26 @@ function roundRectPath(ctx, x, y, w, h, r) {
 function drawSeatMapCanvas() {
   const tables = D().seatMap?.tables || [];
   if (!tables.length) return null;
-  const usedCols = Math.max(1, tables.reduce((m, tb) => Math.max(m, (tb.x ?? 0) + (tb.w ?? 3)), 0));
-  const usedRows = Math.max(1, tables.reduce((m, tb) => Math.max(m, (tb.y ?? 0) + (tb.h ?? 3)), 0));
-  const CELL = 100,
-    GAP = 16,
-    PAD = 30,
-    TITLE_H = 44,
-    STAGE_H = 56,
-    LEGEND_H = 40;
+  // ekspor SENGAJA tidak mengikuti persis piksel x/y/w/h dari mode atur -
+  // itu ukurannya dioptimalkan utk drag-resize di layar (meja lebar/tinggi
+  // beda2, jarak antar meja bisa lebar kalau panitia menata renggang utk
+  // lorong dsb), yg kalau ditiru apa adanya bikin gambar hasil ekspor
+  // banyak spasi kosong & meja/kursi jadi kecil. Cukup pakai URUTAN
+  // relatif baris/kolomnya (brp banyak nilai x/y unik & di posisi ke
+  // berapa) - semua meja digambar SERAGAM & RAPAT ukurannya, spy meja &
+  // kursi bisa besar & jelas tanpa spasi terbuang.
+  const xs = [...new Set(tables.map((tb) => tb.x ?? 0))].sort((a, b) => a - b);
+  const ys = [...new Set(tables.map((tb) => tb.y ?? 0))].sort((a, b) => a - b);
+  const colOf = (tb) => xs.indexOf(tb.x ?? 0);
+  const rowOf = (tb) => ys.indexOf(tb.y ?? 0);
+  const usedCols = xs.length;
+  const usedRows = ys.length;
+  const CELL = 240,
+    GAP = 26,
+    PAD = 34,
+    TITLE_H = 50,
+    STAGE_H = 60,
+    LEGEND_H = 44;
   const contentW = usedCols * CELL + (usedCols - 1) * GAP;
   const contentH = usedRows * CELL + (usedRows - 1) * GAP;
   const canvasW = contentW + PAD * 2;
@@ -4108,16 +4120,11 @@ function drawSeatMapCanvas() {
 
   const gridTop = stageY + STAGE_H + 20;
   tables.forEach((tb) => {
-    const w = tb.w ?? 3,
-      h = tb.h ?? 3;
-    const boxW = w * CELL + (w - 1) * GAP;
-    const boxH = h * CELL + (h - 1) * GAP;
-    const boxX = PAD + (tb.x ?? 0) * (CELL + GAP);
-    const boxY = gridTop + (tb.y ?? 0) * (CELL + GAP);
-    const d = Math.min(boxW, boxH);
-    const cx = boxX + boxW / 2;
-    const cy = boxY + boxH / 2;
-    const r = d / 2;
+    const col = colOf(tb),
+      row = rowOf(tb);
+    const cx = PAD + col * (CELL + GAP) + CELL / 2;
+    const cy = gridTop + row * (CELL + GAP) + CELL / 2;
+    const r = CELL / 2;
 
     // lingkaran tengah pekat (bukan latar bulat besar spt sebelumnya) -
     // cuma penanda posisi meja & nomornya, kursi mengambang bebas di
@@ -4132,8 +4139,20 @@ function drawSeatMapCanvas() {
     ctx.fillText(tb.locked ? "🔒" : tableLabel(tb), cx, cy);
 
     const n = tb.seats;
-    const seatR = r * 0.38;
-    const dotSize = Math.max(9, Math.min(17, Math.round(150 / n)));
+    // 0.38 dipakai sbg PERSEN LEBAR PENUH (2r) di tampilan interaktif
+    // (radius=38, left:${cx}%), bukan persen radius - jadi di sini harus
+    // dikali 2r, bukan r, spy kursi jatuh di dekat tepi lingkaran meja
+    // (sama posisinya spt tampilan interaktif), bukan menggerombol dekat
+    // lingkaran tengah
+    const seatR = r * 0.76;
+    // seatDotSize() (40-70px) dikalibrasi utk diameter meja ~300px (w:3 x
+    // COL_PX:100 di tampilan interaktif) - kanvas ekspor pakai CELL=240
+    // (diameter meja SERAGAM, bukan w*100), jadi disusutkan proporsional
+    // spy rasio ukuran-kursi-thd-lingkar-meja tetap sama & kursi tidak
+    // saling tumpang tindih di sekeliling meja yg lebih kecil ini
+    const dotScale = Math.max(0.35, Math.min(1, CELL / 3 / 100));
+    const dotSize = Math.max(16, Math.round(seatDotSize(n) * dotScale));
+    const fontSize = seatDotFontSize(dotSize);
     for (let i = 0; i < n; i++) {
       const angle = ((360 / n) * i - 90) * (Math.PI / 180);
       const sx = cx + seatR * Math.cos(angle);
@@ -4141,11 +4160,11 @@ function drawSeatMapCanvas() {
       const status = seatStatusOf(tb, seatId(tb.id, i));
       const v = seatDotFillColor(status);
       ctx.beginPath();
-      ctx.arc(sx, sy, dotSize, 0, Math.PI * 2);
+      ctx.arc(sx, sy, dotSize / 2, 0, Math.PI * 2);
       ctx.fillStyle = v.fill;
       ctx.fill();
       ctx.fillStyle = v.text;
-      ctx.font = `bold ${Math.max(7, Math.round(dotSize * 0.9))}px Arial, sans-serif`;
+      ctx.font = `bold ${fontSize}px Arial, sans-serif`;
       ctx.fillText(seatLetter(i), sx, sy);
     }
   });
