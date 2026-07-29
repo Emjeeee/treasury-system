@@ -1805,7 +1805,7 @@ async function setLang(l) {
   await saveSession();
   render();
 }
-const APP_VERSION = "4.0.0";
+const APP_VERSION = "4.3.2";
 const copyrightLine = () =>
   `<div class="hint" style="text-align:center;margin-top:16px">© ${new Date().getFullYear()} Michael Jonathan. ${t("copyright")} • v${APP_VERSION}</div>`;
 const sunIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>`;

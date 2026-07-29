@@ -1,6 +1,6 @@
 {
   "name": "treasury-system",
-  "version": "4.0.0",
+  "version": "4.3.2",
   "private": true,
   "type": "module",
   "scripts": {
