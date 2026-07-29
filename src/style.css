@@ -962,23 +962,6 @@ input[type="number"] {
 .ui-resizable-handle {
   z-index: 2;
 }
-/* .seat-table lingkaran bergantung ke CSS Grid utk containment 2 arah
-   (grid item stretch+aspect-ratio+margin:auto = otomatis pas di kotaknya,
-   dipakai mode LIHAT via <div class="grid">) - tapi grid-stack-item-content
-   (mode ATUR, gridstack) bukan grid/flex container biasa, jadi tanpa bantuan
-   ini lingkarannya bisa lebih tinggi dari sel & kepotong/muncul scrollbar di
-   layar lebar. container queries (cqw/cqh) hitung persegi TERBESAR yg muat
-   di kotak manapun bentuknya, lalu di-flex-center manual di sini. */
-#seatMapGrid > .grid-stack-item > .grid-stack-item-content {
-  container-type: size;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-#seatMapGrid .seat-table {
-  width: min(100cqw, 100cqh);
-  margin: 0;
-}
 .seat-venue {
   background: linear-gradient(180deg, var(--line2), var(--bg) 260px);
   border: 1px solid var(--line);
@@ -1039,13 +1022,26 @@ input[type="number"] {
     0 10px 30px rgba(0, 0, 0, 0.25),
     0 0 0 1px rgba(255, 255, 255, 0.06) inset;
 }
+/* .seat-table = kotak LUAR, ukurannya persis area sel grid manapun (grid
+   biasa mode LIHAT, atau grid-stack-item-content mode ATUR) - lebar & tinggi
+   sel jarang sama persis (mis. meja lebar w:4 tapi tinggi h:3), jadi TIDAK
+   boleh langsung jadi lingkaran di elemen ini (aspect-ratio:1 dgn width:100%
+   akan menghitung tinggi dari LEBAR yg lebih besar, meluber ke baris
+   berikutnya - inilah penyebab meja pernah tampak overlap). .seat-circle
+   = elemen visual DALAM, dgn container queries (cqw/cqh) menghitung persegi
+   TERBESAR yg muat di kotak luar manapun bentuknya, baru jadi lingkaran. */
 .seat-table {
-  /* aspect-ratio:1 + width 100% (bukan height:100%) spy lingkarannya SELALU
-     bundar sungguhan, tidak lonjong spt telur - tinggi cell grid (SEATMAP_ROW_H
-     x h) jarang persis sama dgn lebar kolom, jadi tinggi dibiarkan mengikuti
-     lebar & di tengahkan (margin:auto) dlm area grid yg dialokasikan */
   position: relative;
   width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  container-type: size;
+}
+.seat-circle {
+  position: relative;
+  width: min(100cqw, 100cqh);
   aspect-ratio: 1;
   margin: auto;
   background: var(--card);
@@ -1059,7 +1055,7 @@ input[type="number"] {
     box-shadow 0.2s,
     transform 0.2s;
 }
-.seat-table:hover {
+.seat-circle:hover {
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.1);
   transform: translateY(-1px);
 }

@@ -3692,8 +3692,26 @@ function tablePrice(tb) {
   if (!cat) return 0;
   return cat.tiers?.length ? cat.tiers.find((tr) => tr.id === tb.tierId)?.p || 0 : cat.p || 0;
 }
+// index seatId -> tx dibangun sekali per array S.tx yg BEDA (bukan tiap
+// panggilan) - venue besar (mis. 30 meja x 10 kursi = 300 kursi) yg tadinya
+// scan linear ke SEMUA transaksi utk TIAP kursi (300 x jumlah tx) bikin
+// render terasa berat; cache ini invalid otomatis begitu S.tx direassign
+// oleh pullEvent()/mutateEvent() (referensinya beda), jadi tidak pernah basi
+let _seatIdxTxRef = null,
+  _seatIdxMap = null;
+function seatIndex() {
+  if (_seatIdxTxRef !== S.tx) {
+    _seatIdxMap = new Map();
+    for (const x of S.tx) {
+      if (!x.seatIds?.length) continue;
+      for (const sid of x.seatIds) _seatIdxMap.set(sid, x);
+    }
+    _seatIdxTxRef = S.tx;
+  }
+  return _seatIdxMap;
+}
 function txForSeat(sid) {
-  return S.tx.find((x) => x.seatIds?.includes(sid));
+  return seatIndex().get(sid);
 }
 function seatStatusOf(tb, sid) {
   if (tb.locked) return "locked";
@@ -3998,8 +4016,10 @@ function tableCardHtml(tb, cellPx = 100) {
     })
     .join("");
   return `<div class="seat-table" style="grid-column:${(tb.x ?? 0) + 1} / span ${Math.min(tb.w ?? 3, SEATMAP_COLS)};grid-row:${(tb.y ?? 0) + 1} / span ${tb.h ?? 3}" title="${esc(tableCatLabel(tb))}">
-    <div class="seat-table-center${tb.locked ? " seat-table-locked" : ""}">${tb.locked ? "🔒" : tableLabel(tb)}</div>
-    ${seatsHtml}
+    <div class="seat-circle">
+      <div class="seat-table-center${tb.locked ? " seat-table-locked" : ""}">${tb.locked ? "🔒" : tableLabel(tb)}</div>
+      ${seatsHtml}
+    </div>
   </div>`;
 }
 // versi meja saat mode "atur tata letak" - tampilan sama persis (WYSIWYG,
@@ -4025,8 +4045,10 @@ function tableArrangeTileHtml(tb) {
   return `<div class="grid-stack-item" gs-id="${tb.id}" gs-x="${tb.x ?? 0}" gs-y="${tb.y ?? 0}" gs-w="${tb.w ?? 3}" gs-h="${tb.h ?? 3}">
     <div class="grid-stack-item-content">
       <div class="seat-table" title="${esc(tableCatLabel(tb))}">
-        <div class="seat-table-center${tb.locked ? " seat-table-locked" : ""}">${tb.locked ? "🔒" : tableLabel(tb)}</div>
-        ${seatsHtml}
+        <div class="seat-circle">
+          <div class="seat-table-center${tb.locked ? " seat-table-locked" : ""}">${tb.locked ? "🔒" : tableLabel(tb)}</div>
+          ${seatsHtml}
+        </div>
       </div>
     </div>
   </div>`;
