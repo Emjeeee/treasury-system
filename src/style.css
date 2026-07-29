@@ -490,6 +490,34 @@ nav button.on .dot {
     opacity: 0;
   }
 }
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex: none;
+}
+.btn.ghost .spinner {
+  border-color: var(--line);
+  border-top-color: var(--blue);
+}
+.loading-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 34px 14px;
+  color: var(--tx2);
+  font-size: 15px;
+}
 @keyframes up {
   from {
     transform: translateY(34px);
@@ -727,6 +755,7 @@ th.sortable:hover {
   padding: 12px;
   border: 1.5px solid var(--line);
   background: var(--card);
+  color: var(--tx);
   border-radius: 9px;
   font-weight: 600;
   font-size: 16px;
@@ -740,8 +769,8 @@ th.sortable:hover {
 }
 .banner {
   background: var(--purple-s);
-  color: #4b2fb8;
-  border-bottom: 1px solid #ddd5fb;
+  color: var(--purple);
+  border-bottom: 1px solid var(--line);
   padding: 8px 14px;
   font-size: 14px;
   font-weight: 600;
@@ -923,10 +952,133 @@ input[type="number"] {
   border-color: var(--blue);
 }
 .grid-stack > .grid-stack-item > .grid-stack-item-content {
-  overflow: hidden;
+  /* gridstack.css sendiri set overflow-y:auto di selector yg SAMA
+     spesifisitasnya - krn CSS-nya di-import belakangan (lazy-load saat
+     mode atur/editor dashboard dibuka), aturan itu menang di cascade dan
+     memunculkan scrollbar vertikal + konten kepotong. !important spy
+     override ini yg selalu menang apapun urutan importnya */
+  overflow: hidden !important;
 }
 .ui-resizable-handle {
   z-index: 2;
+}
+/* .seat-table lingkaran bergantung ke CSS Grid utk containment 2 arah
+   (grid item stretch+aspect-ratio+margin:auto = otomatis pas di kotaknya,
+   dipakai mode LIHAT via <div class="grid">) - tapi grid-stack-item-content
+   (mode ATUR, gridstack) bukan grid/flex container biasa, jadi tanpa bantuan
+   ini lingkarannya bisa lebih tinggi dari sel & kepotong/muncul scrollbar di
+   layar lebar. container queries (cqw/cqh) hitung persegi TERBESAR yg muat
+   di kotak manapun bentuknya, lalu di-flex-center manual di sini. */
+#seatMapGrid > .grid-stack-item > .grid-stack-item-content {
+  container-type: size;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#seatMapGrid .seat-table {
+  width: min(100cqw, 100cqh);
+  margin: 0;
+}
+.seat-venue {
+  background: linear-gradient(180deg, var(--line2), var(--bg) 260px);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  margin-top: 16px;
+}
+.seat-table-center {
+  width: 48%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: var(--line2);
+  box-shadow: inset 0 0 0 1px var(--line);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 18px;
+  color: var(--tx);
+  flex: none;
+}
+.seat-table-locked {
+  font-size: 22px;
+}
+.seat-dot {
+  position: absolute;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 2.5px solid var(--card);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+  transition: transform 0.14s;
+}
+.seat-dot:hover {
+  transform: translate(-50%, -50%) scale(1.2);
+  z-index: 2;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
+}
+.seat-dot.static:hover {
+  transform: translate(-50%, -50%);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+.seat-stage {
+  text-align: center;
+  background: linear-gradient(180deg, #2c2e33, var(--ink));
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 18px;
+  border-radius: 14px 14px 4px 4px;
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.25),
+    0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+}
+.seat-table {
+  /* aspect-ratio:1 + width 100% (bukan height:100%) spy lingkarannya SELALU
+     bundar sungguhan, tidak lonjong spt telur - tinggi cell grid (SEATMAP_ROW_H
+     x h) jarang persis sama dgn lebar kolom, jadi tinggi dibiarkan mengikuti
+     lebar & di tengahkan (margin:auto) dlm area grid yg dialokasikan */
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1;
+  margin: auto;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+  transition:
+    box-shadow 0.2s,
+    transform 0.2s;
+}
+.seat-table:hover {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.1);
+  transform: translateY(-1px);
+}
+.seat-selbar {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: calc(var(--nav) + env(safe-area-inset-bottom) + 12px);
+  max-width: 700px;
+  margin: 0 auto;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  z-index: 18;
 }
 
 /* ===== drill-down: elemen dashboard yg bisa diklik utk lihat detail ===== */

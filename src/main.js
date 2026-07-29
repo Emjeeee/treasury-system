@@ -19,6 +19,23 @@ async function loadGridstack() {
   return _GridStack;
 }
 
+// GANTI dgn Client ID asli dari Google Cloud Console (Credentials -> OAuth
+// Client ID -> Web application), dgn URL produksi didaftarkan sbg
+// "Authorized JavaScript origin". Selama masih placeholder ini, tombol
+// "Continue with Google" otomatis jatuh ke alur demo isi-email-manual
+// (googleFlowFallback) - lihat googleFlow().
+const GOOGLE_CLIENT_ID = "1077551401969-tr5oimfqe7e65u0jcstj2qfh0i82dq3m.apps.googleusercontent.com";
+const GOOGLE_CONFIGURED = !GOOGLE_CLIENT_ID.startsWith("YOUR_");
+let googleAuthInitialized = false;
+function initGoogleAuth() {
+  if (!GOOGLE_CONFIGURED || googleAuthInitialized || !window.google?.accounts?.id) return;
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: (response) => googleCredentialLogin(response.credential),
+  });
+  googleAuthInitialized = true;
+}
+
 /* ================= penyimpanan ================= */
 // prefix isolasi untuk verifikasi/testing, jangan pernah sentuh key produksi
 const KEY_PREFIX = import.meta.env.VITE_KEY_PREFIX || "";
@@ -88,6 +105,7 @@ let S = {
 };
 let G = { rev: 0, events: [], users: [], logs: [] };
 let currentEventId = null;
+let mySessionId = null;
 let me = null,
   imp = null,
   lang = "id",
@@ -109,7 +127,9 @@ let chartInstances = {},
   // (yg selalu all-time, tidak per-periode) - admin yg memang mau laporan
   // per-minggu/bulan masih bisa pilih manual di dialog export
   exportKind = "all",
-  monitorCache = null;
+  monitorCache = null,
+  monitorLoading = false,
+  sessionsLoading = false;
 let txPage = 1,
   logPage = 1,
   boardBuyPage = 1,
@@ -121,7 +141,10 @@ let txPage = 1,
   hubStaffPage = 1,
   hubStaffQ = "",
   hubStaffFilter = "all",
-  hubStaffSort = { k: "name", dir: "asc" };
+  hubStaffSort = { k: "name", dir: "asc" },
+  sessionsPage = 1,
+  sessionsQ = "",
+  sessionsFilter = "all";
 const PAGE_SIZE = 20;
 
 const D = () => S.config;
@@ -191,6 +214,7 @@ function logEntry(act, det) {
     asAdmin: imp ? me.email : "",
     act,
     det: det || "",
+    sessionId: mySessionId || "",
   };
 }
 async function pullEvent() {
@@ -287,10 +311,292 @@ async function saveSession() {
         lang,
         theme,
         eventId: currentEventId,
+        sessionId: mySessionId,
       }),
       false,
     );
   } catch (e) {}
+}
+/* ================= sesi pengguna (device/IP/lokasi - monitoring admin) ================= */
+// Supabase RLS proyek ini sengaja tanpa kebijakan DELETE - baris sesi
+// dibersihkan dgn memangkas array (bukan menghapus baris kv_store-nya).
+// "Paksa keluar" diwujudkan lewat flag forceLogout yg dicek perangkat itu
+// SENDIRI lewat heartbeat polling yg sudah ada (bukan push notification
+// sungguhan - aplikasi ini tanpa server, jadi device yg di-force-logout
+// baru benar2 keluar begitu heartbeat berikutnya jalan, maks ~6 detik).
+const SESSIONS_KEY = KEY_PREFIX + "ct_sessions_v1";
+const SESSION_STALE_MS = 24 * 3600 * 1000; // tanpa heartbeat >24 jam -> dianggap basi, dibuang
+const SESSION_ONLINE_MS = 90 * 1000; // heartbeat nulis tiap ~30dtk - >90dtk berarti tab ditutup/nonaktif
+let SESSIONS = { rev: 0, sessions: [] };
+let sessionsCache = null;
+let heartbeatTick = 0;
+function parseUserAgent(ua) {
+  ua = ua || "";
+  let os = "Unknown";
+  if (/Windows NT/.test(ua)) os = "Windows";
+  else if (/iPhone|iPad|iPod/.test(ua)) os = "iOS";
+  else if (/Mac OS X/.test(ua)) os = "macOS";
+  else if (/Android/.test(ua)) os = "Android";
+  else if (/Linux/.test(ua)) os = "Linux";
+  let browser = "Unknown";
+  if (/Edg\//.test(ua)) browser = "Edge";
+  else if (/OPR\/|Opera/.test(ua)) browser = "Opera";
+  else if (/CriOS/.test(ua)) browser = "Chrome (iOS)";
+  else if (/Chrome\//.test(ua) && !/Chromium/.test(ua)) browser = "Chrome";
+  else if (/FxiOS/.test(ua)) browser = "Firefox (iOS)";
+  else if (/Firefox\//.test(ua)) browser = "Firefox";
+  else if (/Safari\//.test(ua) && !/Chrome/.test(ua)) browser = "Safari";
+  const deviceType = /iPad|Tablet/.test(ua) ? "Tablet" : /Mobi|iPhone|Android/.test(ua) ? "Mobile" : "Desktop";
+  return { os, browser, deviceType };
+}
+// geolokasi dari alamat IP publik pemanggil, lewat API pihak ketiga gratis
+// tanpa API key - BUKAN Geolocation API browser (yg minta izin & kasih GPS
+// presisi). Sesuai permintaan: info lokasi didapat TANPA perlu izin ke
+// user, hanya seakurat estimasi kota/negara dari penyedia internetnya.
+async function fetchIpInfo() {
+  try {
+    const r = await fetch("https://ipapi.co/json/");
+    if (!r.ok) throw new Error("bad status " + r.status);
+    const d = await r.json();
+    if (d.error) throw new Error(d.reason || "ipapi error");
+    return { ip: d.ip || "", city: d.city || "", region: d.region || "", country: d.country_name || "", isp: d.org || "" };
+  } catch (e) {
+    console.error("fetchIpInfo() failed:", e);
+    return { ip: "", city: "", region: "", country: "", isp: "" };
+  }
+}
+// Network Information API - cuma didukung Chrome/Edge/Android, tidak ada
+// di Safari/Firefox. Estimasi kasar (bukan pengukuran byte transfer
+// sungguhan, browser tidak punya API utk itu), jadi ditampilkan sbg
+// perkiraan best-effort, bukan angka pasti.
+function currentConnectionInfo() {
+  const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  return c ? { connType: c.effectiveType || "", downlink: c.downlink ?? null } : { connType: "", downlink: null };
+}
+function humanDuration(ms) {
+  if (ms < 0) ms = 0;
+  const mins = Math.floor(ms / 60000);
+  const hrs = Math.floor(mins / 60);
+  const days = Math.floor(hrs / 24);
+  if (days > 0) return `${days}d ${hrs % 24}h`;
+  if (hrs > 0) return `${hrs}h ${mins % 60}m`;
+  if (mins > 0) return `${mins}m`;
+  return t("justNow");
+}
+async function pullSessions() {
+  try {
+    const r = await window.storage.get(SESSIONS_KEY, true);
+    if (r && r.value) {
+      const v = JSON.parse(r.value);
+      if (v.rev !== SESSIONS.rev) {
+        SESSIONS = v;
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error("pullSessions() failed:", e);
+  }
+  return false;
+}
+async function pushSessions() {
+  SESSIONS.rev = (SESSIONS.rev || 0) + 1;
+  try {
+    await window.storage.set(SESSIONS_KEY, JSON.stringify(SESSIONS), true);
+  } catch (e) {
+    console.error("pushSessions() failed:", e);
+  }
+}
+async function mutateSessions(fn) {
+  try {
+    const r = await window.storage.get(SESSIONS_KEY, true);
+    if (r && r.value) SESSIONS = JSON.parse(r.value);
+  } catch (e) {
+    console.error("mutateSessions() pre-fetch failed:", e);
+  }
+  fn();
+  await pushSessions();
+}
+function pruneStaleSessions(sessions) {
+  const cutoff = Date.now() - SESSION_STALE_MS;
+  return (sessions || []).filter((s) => new Date(s.lastSeenAt).getTime() > cutoff);
+}
+// dipanggil sekali per login sungguhan (bukan tiap reload halaman - lihat
+// ensureSessionAlive) - device/browser diambil dari userAgent, lokasi/ISP
+// menyusul async (tidak menghambat proses login)
+async function startSession(user) {
+  mySessionId = uid();
+  const { os, browser, deviceType } = parseUserAgent(navigator.userAgent);
+  const conn = currentConnectionInfo();
+  const session = {
+    id: mySessionId,
+    userId: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    loginAt: now(),
+    lastSeenAt: now(),
+    os,
+    browser,
+    deviceType,
+    ip: "",
+    city: "",
+    region: "",
+    country: "",
+    isp: "",
+    connType: conn.connType,
+    downlink: conn.downlink,
+    forceLogout: false,
+  };
+  await mutateSessions(() => {
+    SESSIONS.sessions = pruneStaleSessions(SESSIONS.sessions);
+    SESSIONS.sessions.push(session);
+  });
+  await saveSession();
+  fetchIpInfo().then((info) => {
+    mutateSessions(() => {
+      const s = SESSIONS.sessions.find((x) => x.id === mySessionId);
+      if (s) Object.assign(s, info);
+    });
+  });
+}
+// dipanggil tiap boot() - kalau sessionId tersimpan (dari reload halaman,
+// bukan login baru) masih ada & belum di-force-logout, cukup perbarui
+// lastSeenAt-nya; kalau tidak (login baru, atau sesi lama sudah dihapus/
+// di-force-logout), buat baris sesi baru
+async function ensureSessionAlive(user) {
+  await pullSessions();
+  const existing = mySessionId && SESSIONS.sessions.find((s) => s.id === mySessionId && !s.forceLogout);
+  if (existing) {
+    await mutateSessions(() => {
+      const s = SESSIONS.sessions.find((x) => x.id === mySessionId);
+      if (s) s.lastSeenAt = now();
+    });
+    return;
+  }
+  await startSession(user);
+}
+async function sessionHeartbeat() {
+  await pullSessions();
+  const mine = mySessionId && SESSIONS.sessions.find((s) => s.id === mySessionId);
+  if (mySessionId && (!mine || mine.forceLogout)) {
+    toast(t("sessionKicked"));
+    await doSignOut(true);
+    return;
+  }
+  heartbeatTick++;
+  if (heartbeatTick % 5 === 0 && mine) {
+    await mutateSessions(() => {
+      const s = SESSIONS.sessions.find((x) => x.id === mySessionId);
+      if (s) s.lastSeenAt = now();
+    });
+  }
+}
+async function loadSessionsView() {
+  sessionsLoading = true;
+  render();
+  await pullSessions();
+  sessionsCache = pruneStaleSessions(SESSIONS.sessions);
+  sessionsPage = 1;
+  sessionsLoading = false;
+  render();
+}
+async function forceLogoutSession(id) {
+  if (!confirm(t("confirmForceLogout"))) return;
+  await mutateSessions(() => {
+    const s = SESSIONS.sessions.find((x) => x.id === id);
+    if (s) s.forceLogout = true;
+  });
+  toast(t("forceLogoutSent"));
+  await loadSessionsView();
+}
+function vHubSessions() {
+  const refreshBtn = `<button class="btn ghost sm" onclick="loadSessionsView()" ${sessionsLoading ? "disabled" : ""}>${sessionsLoading ? `<span class="spinner"></span>` : t("refresh")}</button>`;
+  if (sessionsLoading && !sessionsCache)
+    return `<div class="card"><div class="rowsp" style="margin-bottom:10px"><h2 style="font-size:17px">${t("userSessions")}</h2>${refreshBtn}</div>
+    <div class="loading-row"><span class="spinner"></span>${t("loadingLbl")}</div></div>`;
+  if (!sessionsCache) return `<div class="empty">${t("noneYet")}</div>`;
+  return `<div class="card"><div class="rowsp" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="font-size:17px">${t("userSessions")}</h2>
+    <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;flex-wrap:wrap;min-width:220px">
+      <div class="chips">${[
+        ["all", t("all")],
+        ["online", t("online")],
+        ["offline", t("offline")],
+      ]
+        .map(
+          ([k2, l]) => `<button class="chip ${sessionsFilter === k2 ? "on" : ""}" onclick="setSessionsFilter('${k2}')">${l}</button>`,
+        )
+        .join("")}</div>
+      <input id="sessionsSearchInput" style="max-width:220px" placeholder="${t("searchTx")}" value="${esc(sessionsQ)}" oninput="onSessionsSearch(this.value)">
+      ${refreshBtn}
+    </div></div>
+    <div id="sessionsListBody">${sessionsListHtml()}</div>
+  </div>`;
+}
+function sessionsListHtml() {
+  if (!sessionsCache) return `<div class="empty">${t("noneYet")}</div>`;
+  const q = sessionsQ.toLowerCase();
+  const all = sessionsCache
+    .filter((s) => {
+      const isOnline = Date.now() - new Date(s.lastSeenAt).getTime() < SESSION_ONLINE_MS;
+      if (sessionsFilter === "online" && !isOnline) return false;
+      if (sessionsFilter === "offline" && isOnline) return false;
+      return !q || (s.name + " " + s.email + " " + s.ip + " " + s.city).toLowerCase().includes(q);
+    })
+    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+  const { items, page, totalPages } = paginate(all, sessionsPage, 8);
+  if (!items.length) return `<div class="empty">${t("noneYet")}</div>`;
+  return items.map(sessionRowHtml).join("") + pagerHtml(page, totalPages, "setSessionsPage");
+}
+function setSessionsPage(p) {
+  sessionsPage = p;
+  render();
+}
+function setSessionsFilter(k) {
+  sessionsFilter = k;
+  sessionsPage = 1;
+  render();
+}
+function onSessionsSearch(v) {
+  sessionsQ = v;
+  sessionsPage = 1;
+  clearTimeout(window._ssq);
+  window._ssq = setTimeout(() => {
+    const el = document.getElementById("sessionsListBody");
+    if (el) el.innerHTML = sessionsListHtml();
+  }, 250);
+}
+function sessionRowHtml(s) {
+  const isOnline = Date.now() - new Date(s.lastSeenAt).getTime() < SESSION_ONLINE_MS;
+  const loc = [s.city, s.region, s.country].filter(Boolean).join(", ") || t("unknownLbl");
+  const uptimeMs = Date.now() - new Date(s.loginAt).getTime();
+  const lastSeenMs = Date.now() - new Date(s.lastSeenAt).getTime();
+  const isMine = s.id === mySessionId;
+  return `<div class="drill-row">
+    <div class="drill-row-bar" style="background:${isOnline ? "var(--green)" : "var(--tx3)"}"></div>
+    <div style="flex:1;min-width:0">
+      <div class="rowsp" style="gap:8px;align-items:flex-start">
+        <div style="min-width:0">
+          <div style="font-weight:600">${esc(s.name)}${isMine ? ` · <span class="hint">(${t("thisDevice")})</span>` : ""}</div>
+          <div class="hint">${esc(s.email)} · ${roleLabel(s.role)}</div>
+        </div>
+        <span class="tag ${isOnline ? "t-ok" : "t-exp"}" style="flex:none">${isOnline ? t("online") : t("offline")}</span>
+      </div>
+      <div class="hint mono" style="margin-top:8px;font-size:12.5px;line-height:1.7">
+        ${esc(s.deviceType)} · ${esc(s.browser)} · ${esc(s.os)}<br>
+        IP: ${s.ip ? esc(s.ip) : t("unknownLbl")} · ${esc(loc)}${s.isp ? " · " + esc(s.isp) : ""}<br>
+        ${t("connLbl")}: ${s.connType ? s.connType.toUpperCase() : t("unknownLbl")}${s.downlink ? ` (~${s.downlink} Mbps)` : ""}<br>
+        ${t("loginAtLbl")}: ${new Date(s.loginAt).toLocaleString(lang === "id" ? "id-ID" : "en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })} · ${t("uptimeLbl")}: ${humanDuration(uptimeMs)}<br>
+        ${t("lastSeenLbl")}: ${isOnline ? t("online") : humanDuration(lastSeenMs) + " " + t("agoLbl")}
+      </div>
+      ${
+        isMine
+          ? ""
+          : `<div class="rowsp" style="margin-top:8px"><span></span>
+        <button class="btn danger sm" onclick="forceLogoutSession('${s.id}')">${t("forceLogout")}</button></div>`
+      }
+    </div>
+  </div>`;
 }
 function downloadJSON(obj, filename) {
   const blob = new Blob([JSON.stringify(obj, null, 2)], {
@@ -658,6 +964,21 @@ const L = {
     events: "Acara",
     staff: "Staff",
     monitoring: "Monitoring",
+    userSessions: "Sesi Pengguna",
+    online: "Online",
+    offline: "Offline",
+    unknownLbl: "Tidak diketahui",
+    connLbl: "Koneksi",
+    loginAtLbl: "Masuk",
+    uptimeLbl: "Durasi",
+    lastSeenLbl: "Terakhir aktif",
+    agoLbl: "lalu",
+    justNow: "baru saja",
+    thisDevice: "perangkat ini",
+    forceLogout: "Keluarkan",
+    confirmForceLogout: "Keluarkan sesi ini secara paksa? Pengguna di perangkat itu akan otomatis logout dalam beberapa detik.",
+    forceLogoutSent: "Perintah keluar terkirim",
+    sessionKicked: "Sesi Anda dikeluarkan paksa oleh admin",
     newEvent: "+ Acara baru",
     archive: "Arsipkan",
     restore: "Aktifkan lagi",
@@ -679,6 +1000,7 @@ const L = {
     financialSummary: "Ringkasan keuangan",
     recorded: "Dicatat",
     refresh: "Segarkan",
+    loadingLbl: "Memuat...",
     verified: "Diverifikasi",
     dashboardTab: "Dashboard",
     editDashboard: "Atur dashboard",
@@ -705,6 +1027,70 @@ const L = {
     ofTotal: "dari total",
     clickForDetail: "Klik untuk lihat detail",
     tableMoreHint: "+{n} transaksi lain, buka penuh di tab Transaksi",
+    seatsTab: "Kursi",
+    seatMapTab: "Denah Kursi",
+    seatMapNeedsQtyCat: "Buat dulu kategori kursi (kelompok Penerimaan, aktifkan \"Lacak jumlah\") di Pengaturan sebelum mengatur denah kursi.",
+    seatMapEditorHint: "Atur baris, meja, dan kursi venue Anda.",
+    addTable: "+ Tambah meja",
+    tableRow: "Baris",
+    tableNumber: "Nomor meja",
+    tableNumberShort: "Meja {n}",
+    tableLocked: "Terkunci",
+    tierForTable: "Tingkat",
+    seatsPerTable: "Jumlah kursi per meja",
+    stage: "PANGGUNG / LAYAR",
+    noSeatMapYet: "Denah kursi belum diatur untuk acara ini.",
+    editSeatMap: "Atur denah kursi",
+    arrangeLayout: "Atur tata letak",
+    arrangeModeHint: "Geser & ubah ukuran meja sesuai denah venue Anda, lalu simpan.",
+    arrangeMovedHint: "Untuk mengatur POSISI/tata letak meja, buka tab Kursi lalu tekan \"Atur tata letak\" (hanya admin yang bisa menggeser).",
+    legendAvailable: "Tersedia",
+    legendSelected: "Dipilih",
+    legendSold: "Terjual",
+    legendSponsor: "Sponsor",
+    legendGuest: "Tamu",
+    legendLocked: "Terkunci",
+    seatNumber: "Meja {table} · Kursi {seat}",
+    seatsSelected: "{n} kursi dipilih",
+    selectedSeatsLbl: "Kursi terpilih",
+    cancelSelection: "Batalkan",
+    continueToConfirm: "Lanjutkan ke Konfirmasi",
+    allocType: "Jenis alokasi",
+    seatPriceEach: "{p} / kursi",
+    allocSold: "Jual",
+    allocSponsor: "Sponsor",
+    allocGuest: "Tamu",
+    back: "Kembali",
+    useTemplate: "Gunakan Template",
+    layoutTemplates: "Template Tata Letak",
+    templateSummary: "{n} meja • {s} kursi",
+    applyTemplate: "Terapkan Template",
+    confirmApplyTemplate: "Ini akan mengganti seluruh denah kursi saat ini dengan template ini. Lanjutkan?",
+    tpl3Row: "1 Baris - 3 Meja",
+    tpl4Row: "1 Baris - 4 Meja",
+    tpl5RowTight: "1 Baris - 5 Meja (Rapat)",
+    tpl3x2: "2 Baris x 3 Meja",
+    tpl4x2: "2 Baris x 4 Meja",
+    tpl3x3: "3 Baris x 3 Meja",
+    tpl4x3Tight: "3 Baris x 4 Meja (Rapat)",
+    tplVipFront: "VIP Depan + Reguler Belakang",
+    tplFan: "Setengah Lingkaran Menghadap Panggung",
+    tplUShape: "Bentuk U",
+    tplRow2: "1 Baris - 2 Meja",
+    tplRow6Tight: "1 Baris - 6 Meja (Rapat)",
+    tpl2x2: "2 Baris x 2 Meja",
+    tpl5x2Tight: "2 Baris x 5 Meja (Rapat)",
+    tpl3x4: "4 Baris x 3 Meja",
+    tpl4x4: "4 Baris x 4 Meja (Acara Besar)",
+    tplDiamond: "Formasi Berlian (1-3-1)",
+    tplSideAisles: "Lorong Tengah (2 Kolom)",
+    tplCornerVip: "VIP di Pojok Depan",
+    tplBanquetLong: "2 Baris dengan Lorong Tengah",
+    tableLbl: "Meja",
+    seatNosLbl: "Nomor Kursi",
+    seatNosPlaceholder: "cth: 1,3,5",
+    seatsTakenHint: "Kursi terisi: {list}",
+    seatsAllFreeHint: "Semua kursi tersedia",
   },
   en: {
     dash: "Dashboard",
@@ -947,6 +1333,21 @@ const L = {
     events: "Events",
     staff: "Staff",
     monitoring: "Monitoring",
+    userSessions: "User Sessions",
+    online: "Online",
+    offline: "Offline",
+    unknownLbl: "Unknown",
+    connLbl: "Connection",
+    loginAtLbl: "Signed in",
+    uptimeLbl: "Uptime",
+    lastSeenLbl: "Last active",
+    agoLbl: "ago",
+    justNow: "just now",
+    thisDevice: "this device",
+    forceLogout: "Log out",
+    confirmForceLogout: "Force log out this session? The user on that device will be automatically signed out within a few seconds.",
+    forceLogoutSent: "Logout command sent",
+    sessionKicked: "Your session was forcibly logged out by an admin",
     newEvent: "+ New event",
     archive: "Archive",
     restore: "Restore",
@@ -968,6 +1369,7 @@ const L = {
     financialSummary: "Financial summary",
     recorded: "Recorded",
     refresh: "Refresh",
+    loadingLbl: "Loading...",
     verified: "Verified",
     dashboardTab: "Dashboard",
     editDashboard: "Edit dashboard",
@@ -994,6 +1396,70 @@ const L = {
     ofTotal: "of total",
     clickForDetail: "Click to view detail",
     tableMoreHint: "+{n} more, open the Transactions tab to see all",
+    seatsTab: "Seats",
+    seatMapTab: "Seat Map",
+    seatMapNeedsQtyCat: "Create a seat category first (Income group, with \"Track qty\" enabled) in Settings before setting up the seat map.",
+    seatMapEditorHint: "Set up your venue's rows, tables, and seats.",
+    addTable: "+ Add table",
+    tableRow: "Row",
+    tableNumber: "Table number",
+    tableNumberShort: "Table {n}",
+    tableLocked: "Locked",
+    tierForTable: "Tier",
+    seatsPerTable: "Seats per table",
+    stage: "STAGE / SCREEN",
+    noSeatMapYet: "No seat map set up for this event yet.",
+    editSeatMap: "Set up seat map",
+    arrangeLayout: "Arrange layout",
+    arrangeModeHint: "Drag & resize tables to match your venue's layout, then save.",
+    arrangeMovedHint: "To arrange table POSITIONS, open the Seats tab and tap \"Arrange layout\" (only admins can drag them).",
+    legendAvailable: "Available",
+    legendSelected: "Selected",
+    legendSold: "Sold",
+    legendSponsor: "Sponsor",
+    legendGuest: "Guest",
+    legendLocked: "Locked",
+    seatNumber: "Table {table} · Seat {seat}",
+    seatsSelected: "{n} seats selected",
+    selectedSeatsLbl: "Selected seats",
+    cancelSelection: "Cancel",
+    continueToConfirm: "Continue to Confirmation",
+    allocType: "Allocation type",
+    seatPriceEach: "{p} / seat",
+    allocSold: "Sold",
+    allocSponsor: "Sponsor",
+    allocGuest: "Guest",
+    back: "Back",
+    useTemplate: "Use Template",
+    layoutTemplates: "Layout Templates",
+    templateSummary: "{n} tables • {s} seats",
+    applyTemplate: "Apply Template",
+    confirmApplyTemplate: "This will replace your entire current seat layout with this template. Continue?",
+    tpl3Row: "1 Row - 3 Tables",
+    tpl4Row: "1 Row - 4 Tables",
+    tpl5RowTight: "1 Row - 5 Tables (Compact)",
+    tpl3x2: "2 Rows x 3 Tables",
+    tpl4x2: "2 Rows x 4 Tables",
+    tpl3x3: "3 Rows x 3 Tables",
+    tpl4x3Tight: "3 Rows x 4 Tables (Compact)",
+    tplVipFront: "VIP Front + Regular Behind",
+    tplFan: "Fan / Curved Rows Facing Stage",
+    tplUShape: "U-Shape",
+    tplRow2: "1 Row - 2 Tables",
+    tplRow6Tight: "1 Row - 6 Tables (Compact)",
+    tpl2x2: "2 Rows x 2 Tables",
+    tpl5x2Tight: "2 Rows x 5 Tables (Compact)",
+    tpl3x4: "4 Rows x 3 Tables",
+    tpl4x4: "4 Rows x 4 Tables (Large Event)",
+    tplDiamond: "Diamond Formation (1-3-1)",
+    tplSideAisles: "Center Aisle (2 Columns)",
+    tplCornerVip: "VIP at Front Corners",
+    tplBanquetLong: "2 Rows with Center Aisle",
+    tableLbl: "Table",
+    seatNosLbl: "Seat Numbers",
+    seatNosPlaceholder: "e.g. 1,3,5",
+    seatsTakenHint: "Taken seats: {list}",
+    seatsAllFreeHint: "All seats available",
   },
 };
 const t = (k, v = {}) =>
@@ -1131,6 +1597,14 @@ async function normalizeEventConfig() {
   if (needsCatMigration()) {
     await mutateEvent(() => migrateCatsAndTypes(), null);
   }
+  // acara yg PUNYA denah kursi tapi tpl laporannya blm punya kolom Meja/
+  // Nomor Kursi (dibuat sblm fitur ini ada, atau denahnya baru saja dibuat) -
+  // tambahkan sekali, idempoten (dicek keberadaan kolomnya, bukan flag versi)
+  if (S.config.seatMap?.tables?.length && !S.config.tpl.some((c) => c.f === "seatNos")) {
+    await mutateEvent(() => {
+      S.config.tpl.push({ f: "table", h: "Meja" }, { f: "seatNos", h: "Nomor Kursi" });
+    }, null);
+  }
 }
 // v3.0: dulu kategori cuma tier kursi {n,p,q}, transaksi punya 3 tipe tetap
 // (ticket/donation - keduanya berbagi daftar kategori yg sama - dan expense,
@@ -1219,6 +1693,7 @@ async function boot() {
       me = G.users.find((u) => u.email === v.email && u.active) || null;
       if (me && v.imp) imp = G.users.find((u) => u.email === v.imp) || null;
       savedEventId = v.eventId || null;
+      mySessionId = v.sessionId || null;
     }
   } catch (e) {}
   applyTheme();
@@ -1228,9 +1703,11 @@ async function boot() {
     screen = "auth";
   } else {
     await enterResolved(acting(), savedEventId);
+    await ensureSessionAlive(me);
   }
   render();
   setInterval(async () => {
+    if (me) await sessionHeartbeat();
     if (screen === "app") {
       const ch = await pullEvent();
       await pullHub();
@@ -1261,7 +1738,10 @@ window.addEventListener("resize", () => {
 function render() {
   const r = document.getElementById("root");
   if (screen === "setup") r.innerHTML = vSetup();
-  else if (screen === "auth") r.innerHTML = vAuth();
+  else if (screen === "auth") {
+    r.innerHTML = vAuth();
+    initGoogleAuth();
+  }
   else if (screen === "picker") r.innerHTML = vPicker();
   else if (screen === "hub") r.innerHTML = vHub();
   else {
@@ -1288,6 +1768,11 @@ function render() {
       dashGrid.destroy(false);
       dashGrid = null;
     }
+    if (tab === "seats" && isAdmin() && seatMapArrangeMode) initSeatMapGrid();
+    else if (seatMapGrid) {
+      seatMapGrid.destroy(false);
+      seatMapGrid = null;
+    }
   }
 }
 function langSeg() {
@@ -1303,8 +1788,9 @@ async function setLang(l) {
   await saveSession();
   render();
 }
+const APP_VERSION = "4.0.0";
 const copyrightLine = () =>
-  `<div class="hint" style="text-align:center;margin-top:16px">© ${new Date().getFullYear()} Michael Jonathan. ${t("copyright")}</div>`;
+  `<div class="hint" style="text-align:center;margin-top:16px">© ${new Date().getFullYear()} Michael Jonathan. ${t("copyright")} • v${APP_VERSION}</div>`;
 const sunIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>`;
 const moonIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
 const themeBtn = () =>
@@ -1364,6 +1850,7 @@ async function createFirst() {
   };
   me = u;
   imp = null;
+  await startSession(u);
   const eventEntry = await createEventRow(
     "ev_" + uid(),
     lang === "id" ? "Acara Pertama" : "First Event",
@@ -1395,8 +1882,8 @@ function vAuth() {
     f === "in"
       ? `
     <div class="field"><label>${t("email")}</label><input id="i_email" type="email" autocomplete="username" placeholder="michael@email.com"></div>
-    <div class="field"><label>${t("pass")}</label><input id="i_pass" type="password" autocomplete="current-password" placeholder="••••••••"
-      onkeydown="if(event.key==='Enter')doSignIn()"></div>
+    <div class="field"><label>${t("pass")}</label><div class="pw"><input id="i_pass" type="password" autocomplete="current-password" placeholder="••••••••"
+      onkeydown="if(event.key==='Enter')doSignIn()"><button type="button" class="eye" onclick="toggleEye(this)">${eyeOn}</button></div></div>
     <button class="btn wide" onclick="doSignIn()">${t("signIn")}</button>
     <div class="divider">atau</div>
     <button class="gbtn" onclick="googleFlow()">${gIcon()} ${t("google")}</button>
@@ -1407,8 +1894,8 @@ function vAuth() {
         ? `
     <div class="field"><label>${t("fullName")}</label><input id="u_name"></div>
     <div class="field"><label>${t("email")}</label><input id="u_email" type="email" autocomplete="username"></div>
-    <div class="field"><label>${t("pass")}</label><input id="u_pass" type="password" autocomplete="new-password"></div>
-    <div class="field"><label>${t("pass2")}</label><input id="u_pass2" type="password" autocomplete="new-password"></div>
+    <div class="field"><label>${t("pass")}</label><div class="pw"><input id="u_pass" type="password" autocomplete="new-password"><button type="button" class="eye" onclick="toggleEye(this)">${eyeOn}</button></div></div>
+    <div class="field"><label>${t("pass2")}</label><div class="pw"><input id="u_pass2" type="password" autocomplete="new-password"><button type="button" class="eye" onclick="toggleEye(this)">${eyeOn}</button></div></div>
     <div class="field"><label>${t("recovNew")}</label><input id="u_rec" value="${uid().toUpperCase()}" readonly>
       <div class="hint" style="margin-top:4px">${t("recovHint")}</div></div>
     <button class="btn wide" onclick="doSignUp()">${t("signUp")}</button>
@@ -1418,7 +1905,7 @@ function vAuth() {
         : `
     <div class="field"><label>${t("email")}</label><input id="r_email" type="email"></div>
     <div class="field"><label>${t("recov")}</label><input id="r_rec"></div>
-    <div class="field"><label>${t("newPass")}</label><input id="r_pass" type="password"></div>
+    <div class="field"><label>${t("newPass")}</label><div class="pw"><input id="r_pass" type="password"><button type="button" class="eye" onclick="toggleEye(this)">${eyeOn}</button></div></div>
     <button class="btn wide" onclick="doForgot()">${t("resetPass")}</button>
     <p class="hint" style="margin:12px 0 0">${t("reqAdmin")}</p>
     <button class="btn ghost sm wide" style="margin-top:10px" onclick="setAuthMode('in')">${t("signIn")}</button>`
@@ -1437,6 +1924,7 @@ async function doSignIn() {
   if (!u || u.pass !== (await sha(e + p))) return toast(t("badLogin"));
   me = u;
   imp = null;
+  await startSession(u);
   await mutateHub(() => {
     G.users.find((v) => v.email === e).last = now();
   }, "actLogin", "");
@@ -1472,6 +1960,7 @@ async function doSignUp() {
   };
   me = u;
   imp = null;
+  await startSession(u);
   await mutateHub(() => {
     G.users.push(u);
   }, "actSignup", e);
@@ -1480,23 +1969,23 @@ async function doSignUp() {
   render();
   toast(t("hello", { n }));
 }
-function googleFlow() {
-  sheet(`<div class="rowsp" style="margin-bottom:10px"><h2 style="font-size:19px">${t("gTitle")}</h2>
-    ${closeBtn()}</div>
-    <p class="hint" style="margin:0 0 12px">${t("gSub")}</p>
-    <div class="field"><label>${t("email")}</label><input id="g_email" type="email" placeholder="nama@gmail.com"></div>
-    <div class="field"><label>${t("fullName")}</label><input id="g_name"></div>
-    <button class="btn wide" onclick="doGoogle()">${t("gGo")}</button>`);
-}
-async function doGoogle() {
-  const e = val("g_email").toLowerCase(),
-    n = val("g_name") || e.split("@")[0];
-  if (!e) return toast(t("fillAll"));
+// Google Identity Services (GIS) - login Google SUNGGUHAN (bukan lagi form
+// isi email manual), lihat GOOGLE_CLIENT_ID di dekat atas file. Tanpa
+// backend server: token ID Google didekode LANGSUNG di browser (base64,
+// bukan verifikasi tanda tangan) utk ambil email/nama - cukup utk model
+// keamanan aplikasi ini yg memang sudah ringan (password di-hash SHA-256
+// sisi klien, bukan lewat server auth sungguhan)
+// satu tempat utk find-or-create user Google, dipakai baik oleh alur GIS
+// sungguhan (googleCredentialLogin) maupun fallback demo isi-manual
+// (doGoogleFallback) - biar tidak dobel logika di 2 tempat
+async function loginOrCreateGoogleUser(e, n) {
+  if (!e) return toast(t("badLogin"));
   await pullHub();
   let u = G.users.find((x) => x.email === e);
   if (u) {
     if (!u.active) return toast(t("badLogin"));
     me = u;
+    await startSession(u);
     await mutateHub(() => {
       G.users.find((v) => v.email === e).last = now();
     }, "actLogin", "Google");
@@ -1515,6 +2004,7 @@ async function doGoogle() {
       eventIds: [],
     };
     me = u;
+    await startSession(u);
     await mutateHub(() => {
       G.users.push(u);
     }, "actSignup", e + " · Google");
@@ -1525,6 +2015,62 @@ async function doGoogle() {
   await saveSession();
   render();
   toast(t("hello", { n: me.name }));
+}
+async function googleCredentialLogin(credential) {
+  let payload;
+  try {
+    const b64 = credential.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    payload = JSON.parse(decodeURIComponent(atob(b64).split("").map((c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join("")));
+  } catch (err) {
+    console.error("googleCredentialLogin decode failed:", err);
+    return toast(t("badLogin"));
+  }
+  const e = (payload.email || "").toLowerCase(),
+    n = payload.name || e.split("@")[0];
+  await loginOrCreateGoogleUser(e, n);
+}
+// fallback demo (tanpa Client ID Google asli) - form isi email manual,
+// sama spt sebelumnya. Otomatis dipakai kalau GOOGLE_CLIENT_ID belum diisi
+// atau skrip GIS gagal dimuat.
+function googleFlowFallback() {
+  sheet(`<div class="rowsp" style="margin-bottom:10px"><h2 style="font-size:19px">${t("gTitle")}</h2>
+    ${closeBtn()}</div>
+    <p class="hint" style="margin:0 0 12px">${t("gSub")}</p>
+    <div class="field"><label>${t("email")}</label><input id="g_email" type="email" placeholder="nama@gmail.com"></div>
+    <div class="field"><label>${t("fullName")}</label><input id="g_name"></div>
+    <button class="btn wide" onclick="doGoogleFallback()">${t("gGo")}</button>`);
+}
+async function doGoogleFallback() {
+  const e = val("g_email").toLowerCase(),
+    n = val("g_name") || e.split("@")[0];
+  if (!e) return toast(t("fillAll"));
+  await loginOrCreateGoogleUser(e, n);
+}
+function googleFlow() {
+  if (!GOOGLE_CONFIGURED || !window.google?.accounts?.id) return googleFlowFallback();
+  // kalau prompt Google gagal tampil (mis. origin belum didaftarkan di
+  // Google Cloud Console, browser memblokir, dst) klik tombol jangan
+  // terasa "tidak ngapa-ngapain" - otomatis jatuh ke alur demo isi-manual.
+  // Jaring pengaman waktu jg dipasang krn callback notifikasi GIS kadang
+  // tidak terpanggil sama sekali pas request-nya ditolak keras oleh server.
+  let handled = false;
+  const fallbackTimer = setTimeout(() => {
+    if (!handled) {
+      handled = true;
+      googleFlowFallback();
+    }
+  }, 3500);
+  google.accounts.id.prompt((notification) => {
+    if (handled) return;
+    if (notification.isNotDisplayed?.() || notification.isSkippedMoment?.()) {
+      handled = true;
+      clearTimeout(fallbackTimer);
+      googleFlowFallback();
+    } else if (notification.isDismissedMoment?.()) {
+      handled = true;
+      clearTimeout(fallbackTimer);
+    }
+  });
 }
 async function doForgot() {
   const e = val("r_email").toLowerCase(),
@@ -1545,9 +2091,16 @@ async function doForgot() {
 }
 async function doSignOut(silent) {
   if (!silent) await mutateHub(() => {}, "actLogout", "");
+  if (mySessionId) {
+    const sid = mySessionId;
+    await mutateSessions(() => {
+      SESSIONS.sessions = SESSIONS.sessions.filter((s) => s.id !== sid);
+    });
+  }
   me = null;
   imp = null;
   currentEventId = null;
+  mySessionId = null;
   await saveSession();
   screen = "auth";
   authMode = "in";
@@ -1616,9 +2169,15 @@ function goHub() {
   render();
 }
 function setHubTab(k) {
-  // keluar dari tab Monitoring membuang cache-nya, supaya lain kali dibuka
-  // datanya segar lagi (bukan sisa sebelum ada perubahan acara/staff)
+  // keluar dari tab Monitoring/Sesi Pengguna membuang cache-nya, supaya
+  // lain kali dibuka datanya segar lagi (bukan sisa sebelum ada perubahan)
   if (hubTab === "monitor" && k !== "monitor") monitorCache = null;
+  if (hubTab === "sessions" && k !== "sessions") {
+    sessionsCache = null;
+    sessionsQ = "";
+    sessionsFilter = "all";
+    sessionsPage = 1;
+  }
   hubTab = k;
   render();
 }
@@ -1636,6 +2195,7 @@ function vHub() {
       ["events", t("events")],
       ["staff", t("staff")],
       ["monitor", t("monitoring")],
+      ["sessions", t("userSessions")],
     ]
       .map(
         ([k, l]) =>
@@ -1643,9 +2203,19 @@ function vHub() {
       )
       .join("")}</div>
     ${
-      hubTab === "monitor" && !monitorCache
-        ? (loadMonitor(), `<div class="empty">${t("noneYet")}</div>`)
-        : { events: vHubEvents, staff: vHubStaff, monitor: vHubMonitor }[hubTab]()
+      hubTab === "monitor" && !monitorCache && !monitorLoading
+        ? // setTimeout, bukan panggil loadMonitor() langsung: render() ini
+          // sendiri masih di tengah dijalankan (dipanggil dari dalam
+          // template vHub()) - kalau loadMonitor() dipanggil sinkron di
+          // sini, render() sinkronnya DIA akan selesai & menulis DOM
+          // duluan, lalu KETIMPA lagi begitu render() TERLUAR ini akhirnya
+          // selesai & menulis versi lamanya. Ditunda ke tick berikutnya
+          // spy render() terluar ini sudah tuntas dulu sebelum loadMonitor()
+          // benar2 jalan.
+          (setTimeout(loadMonitor, 0), `<div class="loading-row"><span class="spinner"></span>${t("loadingLbl")}</div>`)
+        : hubTab === "sessions" && !sessionsCache && !sessionsLoading
+          ? (setTimeout(loadSessionsView, 0), `<div class="loading-row"><span class="spinner"></span>${t("loadingLbl")}</div>`)
+          : { events: vHubEvents, staff: vHubStaff, monitor: vHubMonitor, sessions: vHubSessions }[hubTab]()
     }
   </div>`;
 }
@@ -1831,6 +2401,8 @@ async function deleteEventPermanent(id) {
 // mengambil data tiap acara sekaligus, hanya saat tab Monitoring dibuka -
 // bukan polling, supaya tidak membaca semua acara tiap 6 detik
 async function loadMonitor() {
+  monitorLoading = true;
+  render();
   const rows = await Promise.all(
     G.events.map(async (e) => {
       const r = await window.storage.get(eventKey(e.id), true);
@@ -1869,16 +2441,18 @@ async function loadMonitor() {
         };
       }),
   };
+  monitorLoading = false;
   render();
 }
 function vHubMonitor() {
   const m = monitorCache;
+  if (monitorLoading) return `<div class="loading-row"><span class="spinner"></span>${t("loadingLbl")}</div>`;
   if (!m) return `<div class="empty">${t("noneYet")}</div>`;
   const k = (l, v, c) =>
     `<div class="card kpi act" style="padding:11px 13px;justify-content:center"><div class="label">${l}</div><div class="n mono ${c || ""}">${v}</div></div>`;
   return `<div class="rowsp" style="margin-bottom:10px">
     <h2 style="font-size:17px">${t("financialSummary")}</h2>
-    <button class="btn ghost sm" onclick="loadMonitor()">${t("refresh")}</button></div>
+    <button class="btn ghost sm" onclick="loadMonitor()" ${monitorLoading ? "disabled" : ""}>${monitorLoading ? `<span class="spinner"></span>` : t("refresh")}</button></div>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:16px">
     ${
       m.perEvent
@@ -1940,11 +2514,17 @@ function vApp() {
     .filter(Boolean)
     .join(" · ");
   // viewer: cuma boleh lihat Dashboard - tidak ada Transaksi/Peringkat/Admin
-  // di nav, spy tidak ada jalan masuk ke layar yg bisa mengubah data
-  const tabs = canEdit() ? [["dash", t("dash")], ["tx", t("tx")], ["board", t("board")]] : [["dash", t("dash")]];
+  // di nav, spy tidak ada jalan masuk ke layar yg bisa mengubah data. Tab
+  // Kursi cuma muncul kalau acaranya SUDAH punya denah kursi (>=1 meja) -
+  // acara yg tidak pakai fitur ini tidak perlu lihat tab kosong
+  const hasSeatMap = !!D().seatMap?.tables?.length;
+  const tabs = [["dash", t("dash")]];
+  if (canEdit() && hasSeatMap) tabs.push(["seats", t("seatsTab")]);
+  if (canEdit()) tabs.push(["tx", t("tx")], ["board", t("board")]);
   if (isAdmin()) tabs.push(["admin", t("admin")]);
   if (tab === "admin" && !isAdmin()) tab = "dash";
   if ((tab === "tx" || tab === "board") && !canEdit()) tab = "dash";
+  if (tab === "seats" && !(canEdit() && hasSeatMap)) tab = "dash";
   return `${
     imp
       ? `<div class="banner">${t("impBanner", { n: esc(imp.name) })}
@@ -1960,11 +2540,15 @@ function vApp() {
     <button class="btn ghost sm xls-btn" onclick="openExportPeriod()">${downloadIcon}<span class="xls-label">${t("xls")}</span></button>
     <div class="avatar" onclick="openMe()" title="${esc(a.name)}">${esc(a.name.slice(0, 1).toUpperCase())}</div>
   </div></header>
-  <div class="wrap">${{ dash: vDash, tx: vTx, board: vBoard, admin: vAdmin }[tab]()}</div>
+  <div class="wrap">${{ dash: vDash, seats: vSeatMap, tx: vTx, board: vBoard, admin: vAdmin }[tab]()}</div>
   ${(tab === "tx" || tab === "dash") && canEdit() ? `<button class="btn fab" onclick="openTx()">${t("add")}</button>` : ""}
   <nav>${tabs.map(([k, l]) => `<button class="${tab === k ? "on" : ""}" onclick="go('${k}')"><span class="dot"></span>${l}</button>`).join("")}</nav>`;
 }
 function go(k) {
+  // keluar dari tab Kursi sambil masih dlm mode atur tata letak - buang
+  // mode itu, spy lain kali dibuka kembali selalu mulai dari tampilan
+  // booking normal (bukan tersangkut di mode atur)
+  if (tab === "seats" && k !== "seats") seatMapArrangeMode = false;
   tab = k;
   render();
 }
@@ -2590,7 +3174,7 @@ function vDash() {
   // kosong di kiri/kanan layar lebar tidak akan pernah memicu scroll-nya.
   // Di sini dashboard mengalir sebagai konten halaman biasa supaya scroll
   // (mouse wheel/trackpad) bekerja di mana pun kursor berada di layar.
-  return `<div style="padding:10px 0 100px">
+  return `<div style="padding:10px 0 78px">
     <div class="grid" style="grid-template-columns:repeat(${DASHBOARD_COLS},1fr);grid-auto-rows:${DASHBOARD_ROW_H}px;gap:12px">
       ${widgets
         .map((w) => {
@@ -2935,6 +3519,740 @@ async function saveDashLayout() {
   toast(t("setSaved"));
 }
 
+/* ================= denah kursi (seat map / allocation) ================= */
+// tiap meja pilih kategori-nya SENDIRI (bukan satu kategori tetap utk semua
+// meja) - spy mengakomodir 2 gaya kategori kursi yg sudah ada: acara lama
+// dgn Platinum/Gold/Silver sbg 3 kategori terpisah (tb.tierId kosong, harga
+// dari cat.p langsung), maupun acara baru dgn satu kategori "Pembelian
+// Kursi" bertingkat (tb.tierId menunjuk salah satu tingkatnya).
+// Posisi meja BEBAS digeser panitia (grid x/y/w/h, sama spt widget
+// dashboard) - "row"+"number" cuma dipakai sbg LABEL identitas meja (mis.
+// "A1"), bukan lagi penentu tata letak. Editor drag/resize-nya pakai
+// gridstack yg sama dgn editor dashboard (loadGridstack()).
+const SEAT_COLORS = { available: "#ffffff", selected: "#2f6feb", sold: "#d93b3b", sponsor: "#e8b923", guest: "#2f9e5b" };
+// meja pilih putih polos (tidak berwarna gelap spt teks/border putih diatas
+// putih) - butuh border & warna teks kontras sendiri, beda dari status lain
+// yg pakai warna solid + teks putih
+const SEAT_AVAILABLE_BORDER = "#c9c6be";
+const SEAT_AVAILABLE_TEXT = "#6b6860";
+const SEATMAP_COLS = 12;
+const SEATMAP_ROW_H = 110;
+// 10 template denah siap-pakai - cuma posisi/ukuran/jumlah kursi (x,y,w,h,
+// seats), TIDAK menyimpan kategori (kategori kursi berbeda2 tiap acara) -
+// admin pilih kategori saat menerapkan (lihat applySeatTemplate()). y=0
+// paling dekat panggung, makin besar y makin jauh ke belakang venue.
+const SEATMAP_TEMPLATES = [
+  { id: "row3", nameKey: "tpl3Row", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 3, y: 0, w: 3, h: 3, seats: 8 }, { x: 6, y: 0, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "row4", nameKey: "tpl4Row", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 3, y: 0, w: 3, h: 3, seats: 8 }, { x: 6, y: 0, w: 3, h: 3, seats: 8 }, { x: 9, y: 0, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "row5", nameKey: "tpl5RowTight", tables: [
+    { x: 0, y: 0, w: 2, h: 2, seats: 6 }, { x: 2, y: 0, w: 2, h: 2, seats: 6 }, { x: 4, y: 0, w: 2, h: 2, seats: 6 }, { x: 6, y: 0, w: 2, h: 2, seats: 6 }, { x: 8, y: 0, w: 2, h: 2, seats: 6 },
+  ]},
+  { id: "grid3x2", nameKey: "tpl3x2", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 3, y: 0, w: 3, h: 3, seats: 8 }, { x: 6, y: 0, w: 3, h: 3, seats: 8 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 8 }, { x: 3, y: 3, w: 3, h: 3, seats: 8 }, { x: 6, y: 3, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "grid4x2", nameKey: "tpl4x2", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 3, y: 0, w: 3, h: 3, seats: 8 }, { x: 6, y: 0, w: 3, h: 3, seats: 8 }, { x: 9, y: 0, w: 3, h: 3, seats: 8 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 8 }, { x: 3, y: 3, w: 3, h: 3, seats: 8 }, { x: 6, y: 3, w: 3, h: 3, seats: 8 }, { x: 9, y: 3, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "grid3x3", nameKey: "tpl3x3", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 3, y: 0, w: 3, h: 3, seats: 8 }, { x: 6, y: 0, w: 3, h: 3, seats: 8 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 8 }, { x: 3, y: 3, w: 3, h: 3, seats: 8 }, { x: 6, y: 3, w: 3, h: 3, seats: 8 },
+    { x: 0, y: 6, w: 3, h: 3, seats: 8 }, { x: 3, y: 6, w: 3, h: 3, seats: 8 }, { x: 6, y: 6, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "grid4x3Tight", nameKey: "tpl4x3Tight", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 6 }, { x: 3, y: 0, w: 3, h: 3, seats: 6 }, { x: 6, y: 0, w: 3, h: 3, seats: 6 }, { x: 9, y: 0, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 6 }, { x: 3, y: 3, w: 3, h: 3, seats: 6 }, { x: 6, y: 3, w: 3, h: 3, seats: 6 }, { x: 9, y: 3, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 6, w: 3, h: 3, seats: 6 }, { x: 3, y: 6, w: 3, h: 3, seats: 6 }, { x: 6, y: 6, w: 3, h: 3, seats: 6 }, { x: 9, y: 6, w: 3, h: 3, seats: 6 },
+  ]},
+  { id: "vipFront", nameKey: "tplVipFront", tables: [
+    { x: 3, y: 0, w: 3, h: 3, seats: 10 }, { x: 6, y: 0, w: 3, h: 3, seats: 10 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 6 }, { x: 3, y: 3, w: 3, h: 3, seats: 6 }, { x: 6, y: 3, w: 3, h: 3, seats: 6 }, { x: 9, y: 3, w: 3, h: 3, seats: 6 },
+  ]},
+  { id: "fanCurve", nameKey: "tplFan", tables: [
+    { x: 4, y: 0, w: 3, h: 3, seats: 8 },
+    { x: 1, y: 3, w: 3, h: 3, seats: 8 }, { x: 4, y: 3, w: 3, h: 3, seats: 8 }, { x: 7, y: 3, w: 3, h: 3, seats: 8 },
+    { x: 0, y: 6, w: 2, h: 2, seats: 6 }, { x: 2, y: 6, w: 2, h: 2, seats: 6 }, { x: 4, y: 6, w: 2, h: 2, seats: 6 }, { x: 6, y: 6, w: 2, h: 2, seats: 6 }, { x: 8, y: 6, w: 2, h: 2, seats: 6 },
+  ]},
+  { id: "uShape", nameKey: "tplUShape", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 0, y: 3, w: 3, h: 3, seats: 8 }, { x: 0, y: 6, w: 3, h: 3, seats: 8 },
+    { x: 9, y: 0, w: 3, h: 3, seats: 8 }, { x: 9, y: 3, w: 3, h: 3, seats: 8 }, { x: 9, y: 6, w: 3, h: 3, seats: 8 },
+    { x: 3, y: 9, w: 3, h: 3, seats: 8 }, { x: 6, y: 9, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "row2", nameKey: "tplRow2", tables: [
+    { x: 3, y: 0, w: 3, h: 3, seats: 8 }, { x: 6, y: 0, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "row6Tight", nameKey: "tplRow6Tight", tables: [
+    { x: 0, y: 0, w: 2, h: 2, seats: 6 }, { x: 2, y: 0, w: 2, h: 2, seats: 6 }, { x: 4, y: 0, w: 2, h: 2, seats: 6 },
+    { x: 6, y: 0, w: 2, h: 2, seats: 6 }, { x: 8, y: 0, w: 2, h: 2, seats: 6 }, { x: 10, y: 0, w: 2, h: 2, seats: 6 },
+  ]},
+  { id: "grid2x2", nameKey: "tpl2x2", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 3, y: 0, w: 3, h: 3, seats: 8 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 8 }, { x: 3, y: 3, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "grid5x2Tight", nameKey: "tpl5x2Tight", tables: [
+    { x: 0, y: 0, w: 2, h: 2, seats: 6 }, { x: 2, y: 0, w: 2, h: 2, seats: 6 }, { x: 4, y: 0, w: 2, h: 2, seats: 6 }, { x: 6, y: 0, w: 2, h: 2, seats: 6 }, { x: 8, y: 0, w: 2, h: 2, seats: 6 },
+    { x: 0, y: 2, w: 2, h: 2, seats: 6 }, { x: 2, y: 2, w: 2, h: 2, seats: 6 }, { x: 4, y: 2, w: 2, h: 2, seats: 6 }, { x: 6, y: 2, w: 2, h: 2, seats: 6 }, { x: 8, y: 2, w: 2, h: 2, seats: 6 },
+  ]},
+  { id: "grid3x4", nameKey: "tpl3x4", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 6 }, { x: 3, y: 0, w: 3, h: 3, seats: 6 }, { x: 6, y: 0, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 6 }, { x: 3, y: 3, w: 3, h: 3, seats: 6 }, { x: 6, y: 3, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 6, w: 3, h: 3, seats: 6 }, { x: 3, y: 6, w: 3, h: 3, seats: 6 }, { x: 6, y: 6, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 9, w: 3, h: 3, seats: 6 }, { x: 3, y: 9, w: 3, h: 3, seats: 6 }, { x: 6, y: 9, w: 3, h: 3, seats: 6 },
+  ]},
+  { id: "grid4x4", nameKey: "tpl4x4", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 6 }, { x: 3, y: 0, w: 3, h: 3, seats: 6 }, { x: 6, y: 0, w: 3, h: 3, seats: 6 }, { x: 9, y: 0, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 3, w: 3, h: 3, seats: 6 }, { x: 3, y: 3, w: 3, h: 3, seats: 6 }, { x: 6, y: 3, w: 3, h: 3, seats: 6 }, { x: 9, y: 3, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 6, w: 3, h: 3, seats: 6 }, { x: 3, y: 6, w: 3, h: 3, seats: 6 }, { x: 6, y: 6, w: 3, h: 3, seats: 6 }, { x: 9, y: 6, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 9, w: 3, h: 3, seats: 6 }, { x: 3, y: 9, w: 3, h: 3, seats: 6 }, { x: 6, y: 9, w: 3, h: 3, seats: 6 }, { x: 9, y: 9, w: 3, h: 3, seats: 6 },
+  ]},
+  { id: "diamond", nameKey: "tplDiamond", tables: [
+    { x: 4, y: 0, w: 3, h: 3, seats: 8 },
+    { x: 1, y: 3, w: 3, h: 3, seats: 8 }, { x: 4, y: 3, w: 3, h: 3, seats: 8 }, { x: 7, y: 3, w: 3, h: 3, seats: 8 },
+    { x: 4, y: 6, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "sideAisles", nameKey: "tplSideAisles", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 8 }, { x: 0, y: 3, w: 3, h: 3, seats: 8 }, { x: 0, y: 6, w: 3, h: 3, seats: 8 },
+    { x: 8, y: 0, w: 3, h: 3, seats: 8 }, { x: 8, y: 3, w: 3, h: 3, seats: 8 }, { x: 8, y: 6, w: 3, h: 3, seats: 8 },
+  ]},
+  { id: "cornerVip", nameKey: "tplCornerVip", tables: [
+    { x: 0, y: 0, w: 3, h: 3, seats: 10 }, { x: 9, y: 0, w: 3, h: 3, seats: 10 },
+    { x: 3, y: 3, w: 3, h: 3, seats: 6 }, { x: 6, y: 3, w: 3, h: 3, seats: 6 },
+    { x: 0, y: 6, w: 3, h: 3, seats: 6 }, { x: 3, y: 6, w: 3, h: 3, seats: 6 }, { x: 6, y: 6, w: 3, h: 3, seats: 6 }, { x: 9, y: 6, w: 3, h: 3, seats: 6 },
+  ]},
+  { id: "banquetLong", nameKey: "tplBanquetLong", tables: [
+    { x: 0, y: 0, w: 2, h: 2, seats: 6 }, { x: 2, y: 0, w: 2, h: 2, seats: 6 }, { x: 8, y: 0, w: 2, h: 2, seats: 6 }, { x: 10, y: 0, w: 2, h: 2, seats: 6 },
+    { x: 0, y: 2, w: 2, h: 2, seats: 6 }, { x: 2, y: 2, w: 2, h: 2, seats: 6 }, { x: 8, y: 2, w: 2, h: 2, seats: 6 }, { x: 10, y: 2, w: 2, h: 2, seats: 6 },
+  ]},
+];
+let templatePickerPage = 1;
+const TEMPLATE_PAGE_SIZE = 6;
+let seatMapGrid = null;
+// mode "atur tata letak" - admin-only, diaktifkan lewat tombol di halaman
+// Kursi itu sendiri (BUKAN di Admin > Denah Kursi lagi). Selama mode ini
+// aktif, kursi jadi non-klik (booking dimatikan sementara) & meja bisa
+// digeser/diubah ukuran lewat gridstack, persis mode edit dashboard.
+let seatMapArrangeMode = false;
+const seatId = (tableId, i) => `${tableId}:${i}`;
+// ukuran lingkaran kursi dinamis thd jumlah kursi 1 meja - meja dgn sedikit
+// kursi dapat lingkaran besar (biar tidak ada gap kosong berlebihan di
+// sekeliling meja), meja dgn banyak kursi otomatis mengecil spy antar kursi
+// tidak bertumpuk (radius lingkaran meja tetap konstan)
+function seatDotSize(n) {
+  return Math.max(40, Math.min(70, Math.round(600 / Math.max(n, 1))));
+}
+function seatDotFontSize(size) {
+  return Math.max(10, Math.round(size * 0.22));
+}
+// kursi "tersedia" pakai isian putih polos - butuh border & warna teks
+// kontras sendiri (bukan putih diatas putih spt status lain yg pakai
+// warna solid + teks putih)
+function seatDotVisual(status) {
+  if (status === "available") return { bg: SEAT_COLORS.available, border: SEAT_AVAILABLE_BORDER, color: SEAT_AVAILABLE_TEXT };
+  return { bg: SEAT_COLORS[status] || "#5a5a55", border: "var(--card)", color: "#fff" };
+}
+// state pemilihan kursi (multi-select) - direset tiap pindah meja, krn 1
+// transaksi booking cuma boleh mencakup kursi2 DALAM SATU meja yg sama
+let seatSelection = null; // { tableId, seats: number[] }
+// kategori yg masuk akal dipakai sbg "kursi" - income & melacak jumlah,
+// sama spt syarat kategori yg tampil di panel Kuota/Ketersediaan dashboard
+const seatableCats = () => D().cats.filter((c) => c.group === "income" && c.hasQty);
+function seatTables() {
+  return D().seatMap?.tables || [];
+}
+function findTable(id) {
+  return seatTables().find((t) => t.id === id);
+}
+function tableCat(tb) {
+  return D().cats.find((c) => c.id === tb.catId);
+}
+function tableTierName(tb) {
+  const cat = tableCat(tb);
+  return cat?.tiers?.length ? cat.tiers.find((tr) => tr.id === tb.tierId)?.name || "" : "";
+}
+function tableCatLabel(tb) {
+  const cat = tableCat(tb);
+  const tier = tableTierName(tb);
+  return tier ? `${cat?.n || ""} - ${tier}` : cat?.n || "";
+}
+function tableLabel(tb) {
+  return `${tb.row}${tb.number}`;
+}
+function tablePrice(tb) {
+  const cat = tableCat(tb);
+  if (!cat) return 0;
+  return cat.tiers?.length ? cat.tiers.find((tr) => tr.id === tb.tierId)?.p || 0 : cat.p || 0;
+}
+function txForSeat(sid) {
+  return S.tx.find((x) => x.seatIds?.includes(sid));
+}
+function seatStatusOf(tb, sid) {
+  if (tb.locked) return "locked";
+  if (seatSelection?.tableId === tb.id && seatSelection.seats.includes(+sid.split(":")[1])) return "selected";
+  const x = txForSeat(sid);
+  return x ? x.allocType || "sold" : "available";
+}
+// pengaturan meja (kategori/tingkat/jumlah kursi/kunci) tetap di sini
+// (Admin > Denah Kursi) - tapi GESER POSISI meja sengaja dipindah ke
+// halaman Kursi sendiri (lihat toggleSeatMapArrange()), krn di situ admin
+// bisa lihat LANGSUNG bentuk denahnya dari sudut pandang yg sama dgn staff/
+// treasurer, bukan dari daftar terpisah di Admin.
+function vSeatMapEditor() {
+  const sm = D().seatMap || { tables: [] };
+  const cats = seatableCats();
+  if (!cats.length) return `<div class="empty">${t("seatMapNeedsQtyCat")}</div>`;
+  return `<div class="card" style="margin-bottom:12px">
+    <div class="rowsp" style="flex-wrap:wrap;gap:8px">
+      <p class="hint" style="margin:0;flex:1;min-width:220px">${t("seatMapEditorHint")}</p>
+      <div style="display:flex;gap:8px;flex:none">
+        <button class="btn ghost sm" onclick="openTemplatePicker()">${t("useTemplate")}</button>
+        <button class="btn ghost sm" onclick="openTableForm()">${t("addTable")}</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    ${
+      sm.tables.length
+        ? `<div style="overflow-x:auto"><table style="min-width:520px"><thead><tr>
+      <th style="min-width:70px">${t("tableRow")}</th><th style="min-width:70px">${t("tableNumber")}</th>
+      <th style="min-width:160px">${t("txCat")}</th><th style="min-width:70px">${t("seatsPerTable")}</th>
+      <th style="min-width:70px">${t("tableLocked")}</th><th></th></tr></thead><tbody>
+    ${sm.tables
+      .map(
+        (tb) => `<tr>
+      <td style="font-weight:600">${esc(tb.row)}</td>
+      <td class="mono">${tb.number}</td>
+      <td>${esc(tableCatLabel(tb))}</td>
+      <td class="mono">${tb.seats}</td>
+      <td>${tb.locked ? `<span class="tag t-exp">${t("tableLocked")}</span>` : "-"}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn ghost sm" onclick="openTableForm('${tb.id}')">${t("edit")}</button>
+        <button class="btn danger sm" onclick="deleteTable('${tb.id}')">${t("del")}</button>
+      </td></tr>`,
+      )
+      .join("")}
+    </tbody></table></div>`
+        : `<div class="empty">${t("noneYet")}</div>`
+    }
+  </div>
+  <p class="hint" style="margin-top:10px">${t("arrangeMovedHint")}</p>`;
+}
+/* ================= template denah siap-pakai ================= */
+function templateSeatTotal(tpl) {
+  return tpl.tables.reduce((s, tb) => s + tb.seats, 0);
+}
+// mini-preview di daftar template - cuma titik2 kecil sesuai posisi
+// relatif x/y (bukan render kursi penuh spt tableCardHtml, krn 10 item
+// ditampilkan sekaligus, jaga ringan) di dalam kotak preview kecil
+function templateThumbHtml(tpl) {
+  const maxX = Math.max(...tpl.tables.map((tb) => tb.x + tb.w));
+  const maxY = Math.max(...tpl.tables.map((tb) => tb.y + tb.h));
+  const dots = tpl.tables
+    .map((tb) => {
+      const cx = ((tb.x + tb.w / 2) / maxX) * 100;
+      const cy = ((tb.y + tb.h / 2) / maxY) * 100;
+      const size = Math.max(10, Math.min(22, (tb.w / maxX) * 100));
+      return `<span style="position:absolute;left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;transform:translate(-50%,-50%);border-radius:50%;background:var(--card);border:1.5px solid var(--line)"></span>`;
+    })
+    .join("");
+  return `<div style="position:relative;width:100%;aspect-ratio:16/10;background:var(--line2);border-radius:8px;overflow:hidden">${dots}</div>`;
+}
+// sheet dibungkus flex-column dgn max-height, spy header/pager (mode
+// picker) atau header/kategori/tombol Terapkan (mode preview) SELALU
+// kelihatan tanpa perlu scroll - yg scroll (kalau kepanjangan) cuma area
+// grid/thumbnail-nya sendiri, bukan seluruh sheet
+function setTemplatePickerPage(p) {
+  templatePickerPage = p;
+  openTemplatePicker();
+}
+function openTemplatePicker() {
+  const { items, page, totalPages } = paginate(SEATMAP_TEMPLATES, templatePickerPage, TEMPLATE_PAGE_SIZE);
+  sheet(`<div style="display:flex;flex-direction:column;max-height:78vh">
+    <div class="rowsp" style="margin-bottom:14px;flex:none"><h2 style="font-size:20px">${t("layoutTemplates")}</h2>${closeBtn()}</div>
+    <div style="overflow-y:auto;flex:1 1 auto;min-height:0">
+      <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px">
+        ${items
+          .map(
+            (tpl) => `<button type="button" class="btn ghost" style="height:auto;display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:10px;text-align:left" onclick="previewSeatTemplate('${tpl.id}')">
+          ${templateThumbHtml(tpl)}
+          <div>
+            <div style="font-weight:600">${t(tpl.nameKey)}</div>
+            <div class="hint" style="font-size:12px">${t("templateSummary", { n: tpl.tables.length, s: templateSeatTotal(tpl) })}</div>
+          </div>
+        </button>`,
+          )
+          .join("")}
+      </div>
+    </div>
+    <div style="flex:none">${pagerHtml(page, totalPages, "setTemplatePickerPage")}</div>
+  </div>`);
+}
+function previewSeatTemplate(id) {
+  const tpl = SEATMAP_TEMPLATES.find((x) => x.id === id);
+  const cats = seatableCats();
+  const previewTables = tpl.tables.map((tb, i) => ({ id: `tpl_preview_${i}`, row: "A", number: i + 1, catId: cats[0]?.id || "", tierId: "", locked: false, ...tb }));
+  const usedCols = Math.max(6, Math.min(SEATMAP_COLS, previewTables.reduce((m, tb) => Math.max(m, tb.x + tb.w), 0)));
+  const usedRows = Math.max(1, previewTables.reduce((m, tb) => Math.max(m, tb.y + tb.h), 0));
+  // lebar tersedia dihitung dr lebar sheet SUNGGUHAN (max 680px, dikurangi
+  // padding) - bukan angka tetap - spy grid template SELALU muat tanpa
+  // perlu scroll horizontal apapun jumlah kolomnya, kursi ikut menyusut
+  // proporsional lewat parameter cellPx (lihat tableCardHtml)
+  const sheetW = Math.min(680, typeof window !== "undefined" ? window.innerWidth : 680);
+  const availW = sheetW - 36 - 8; // padding sheet 18px*2 + sedikit slack
+  const gap = 8;
+  const colPx = Math.max(28, Math.floor((availW - gap * (usedCols - 1)) / usedCols));
+  sheet(`<div style="display:flex;flex-direction:column;max-height:82vh">
+    <div class="rowsp" style="margin-bottom:10px;flex:none">
+      <button type="button" class="btn ghost sm icon" onclick="openTemplatePicker()" aria-label="${t("back")}" title="${t("back")}">‹</button>
+      <h2 style="font-size:18px;flex:1;text-align:center">${t(tpl.nameKey)}</h2>${closeBtn()}</div>
+    <p class="hint" style="text-align:center;margin-bottom:10px;flex:none">${t("templateSummary", { n: tpl.tables.length, s: templateSeatTotal(tpl) })}</p>
+    <div style="overflow:auto;background:var(--line2);border-radius:12px;padding:14px 4px;margin-bottom:14px;flex:1 1 auto;min-height:0">
+      <div class="grid" style="grid-template-columns:repeat(${usedCols},${colPx}px);grid-auto-rows:${colPx}px;gap:${gap}px;width:${usedCols * colPx + (usedCols - 1) * gap}px;height:${usedRows * colPx + (usedRows - 1) * gap}px;margin:0 auto">
+        ${previewTables.map((tb) => tableCardHtml(tb, colPx)).join("")}
+      </div>
+    </div>
+    <div style="flex:none">
+      <div class="field"><label>${t("txCat")}</label><select id="tpl_cat" onchange="onTemplateCatChange()">
+        ${cats.map((c) => `<option value="${c.id}">${esc(c.n)}</option>`).join("")}
+      </select></div>
+      <div class="field" id="tpl_w_tier" style="display:none"><label>${t("tierForTable")}</label><select id="tpl_tier"></select></div>
+      <div class="rowsp" style="margin-top:14px"><span></span>
+        <button class="btn" onclick="applySeatTemplate('${tpl.id}')">${t("applyTemplate")}</button></div>
+    </div>
+  </div>`);
+  onTemplateCatChange();
+}
+function onTemplateCatChange() {
+  const catId = document.getElementById("tpl_cat").value;
+  const cat = D().cats.find((c) => c.id === catId);
+  const tiers = cat?.tiers || [];
+  const wrap = document.getElementById("tpl_w_tier");
+  wrap.style.display = tiers.length ? "block" : "none";
+  if (tiers.length) {
+    document.getElementById("tpl_tier").innerHTML = tiers.map((tr) => `<option value="${tr.id}">${esc(tr.name)} (${rp(tr.p)})</option>`).join("");
+  }
+}
+async function applySeatTemplate(id) {
+  const tpl = SEATMAP_TEMPLATES.find((x) => x.id === id);
+  const catId = val("tpl_cat");
+  const cat = D().cats.find((c) => c.id === catId);
+  const tierId = cat?.tiers?.length ? val("tpl_tier") : "";
+  const existing = D().seatMap?.tables || [];
+  if (existing.length && !confirm(t("confirmApplyTemplate"))) return;
+  // urutkan per baris (nilai y) dari yg paling dekat panggung, lalu beri
+  // label baris A/B/C... & nomor meja urut dalam baris itu (kiri ke kanan)
+  const rowYs = [...new Set(tpl.tables.map((tb) => tb.y))].sort((a, b) => a - b);
+  const newTables = tpl.tables
+    .slice()
+    .sort((a, b) => a.y - b.y || a.x - b.x)
+    .map((tb) => {
+      const rowIdx = rowYs.indexOf(tb.y);
+      const rowLabel = String.fromCharCode(65 + rowIdx);
+      const numberInRow = tpl.tables.filter((t2) => t2.y === tb.y && t2.x <= tb.x).length;
+      return { id: uid(), row: rowLabel, number: numberInRow, catId, tierId, seats: tb.seats, locked: false, x: tb.x, y: tb.y, w: tb.w, h: tb.h };
+    });
+  await mutate(() => {
+    if (!S.config.seatMap) S.config.seatMap = { tables: [] };
+    S.config.seatMap.tables = newTables;
+  }, "actSet", t("useTemplate"));
+  closeSheet();
+  toast(t("setSaved"));
+  render();
+}
+async function initSeatMapGrid() {
+  seatMapGrid?.destroy(false);
+  seatMapGrid = null;
+  const el = document.getElementById("seatMapGrid");
+  if (!el) return;
+  const GridStack = await loadGridstack();
+  if (!document.body.contains(el)) return;
+  seatMapGrid = GridStack.init({ column: SEATMAP_COLS, cellHeight: SEATMAP_ROW_H, margin: 8, float: true }, el);
+}
+async function saveSeatMapLayout() {
+  if (!seatMapGrid) return toast(t("saveErr"));
+  const positions = {};
+  seatMapGrid.engine.nodes.forEach((n) => {
+    positions[n.id] = { x: n.x, y: n.y, w: n.w, h: n.h };
+  });
+  await mutate(() => {
+    (S.config.seatMap?.tables || []).forEach((tb) => {
+      const p = positions[tb.id];
+      if (p) Object.assign(tb, p);
+    });
+  }, "actSet", t("saveLayout"));
+  seatMapArrangeMode = false;
+  toast(t("setSaved"));
+  render();
+}
+function toggleSeatMapArrange() {
+  seatMapArrangeMode = true;
+  seatSelection = null; // buang seleksi kursi yg sdg berjalan spy tak nyangkut saat kembali ke mode normal
+  render();
+}
+function cancelSeatMapArrange() {
+  seatMapArrangeMode = false;
+  render();
+}
+function openTableForm(id) {
+  const sm = D().seatMap || { tables: [] };
+  const tb = id ? sm.tables.find((t) => t.id === id) : null;
+  const cats = seatableCats();
+  const selectedCatId = tb?.catId || cats[0]?.id || "";
+  sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:20px">${tb ? t("edit") : t("addTable")}</h2>${closeBtn()}</div>
+    <input type="hidden" id="tb_id" value="${tb ? tb.id : ""}">
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="field"><label>${t("tableRow")}</label><input id="tb_row" value="${esc(tb ? tb.row : "A")}" maxlength="4"></div>
+      <div class="field"><label>${t("tableNumber")}</label><input type="number" min="1" id="tb_number" value="${tb ? tb.number : sm.tables.length + 1}"></div>
+    </div>
+    <div class="field"><label>${t("txCat")}</label><select id="tb_cat" onchange="onTableCatChange()">
+      ${cats.map((c) => `<option value="${c.id}" ${selectedCatId === c.id ? "selected" : ""}>${esc(c.n)}</option>`).join("")}
+    </select></div>
+    <div class="field" id="tb_w_tier" style="display:none">
+      <label>${t("tierForTable")}</label>
+      <select id="tb_tier"></select></div>
+    <div class="field"><label>${t("seatsPerTable")}</label><input type="number" min="1" id="tb_seats" value="${tb ? tb.seats : 10}"></div>
+    <div class="field" style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="tb_locked" ${tb?.locked ? "checked" : ""} style="width:auto"><label style="margin:0" for="tb_locked">${t("tableLocked")}</label></div>
+    <div class="rowsp" style="margin-top:14px">${tb ? `<button class="btn danger" onclick="deleteTable('${tb.id}')">${t("del")}</button>` : "<span></span>"}
+      <button class="btn" onclick="submitTableForm()">${t("save")}</button></div>`);
+  onTableCatChange(tb?.tierId);
+}
+function onTableCatChange(wantTierId) {
+  const catId = document.getElementById("tb_cat").value;
+  const cat = D().cats.find((c) => c.id === catId);
+  const tiers = cat?.tiers || [];
+  const wrap = document.getElementById("tb_w_tier");
+  wrap.style.display = tiers.length ? "block" : "none";
+  if (tiers.length) {
+    const tierSel = document.getElementById("tb_tier");
+    tierSel.innerHTML = tiers.map((tr) => `<option value="${tr.id}">${esc(tr.name)} (${rp(tr.p)})</option>`).join("");
+    if (wantTierId && tiers.some((tr) => tr.id === wantTierId)) tierSel.value = wantTierId;
+  }
+}
+async function submitTableForm() {
+  const id = val("tb_id");
+  const row = val("tb_row") || "A";
+  const number = +val("tb_number") || 1;
+  const catId = document.getElementById("tb_cat").value;
+  const cat = D().cats.find((c) => c.id === catId);
+  const tierId = cat?.tiers?.length ? document.getElementById("tb_tier").value : "";
+  const seats = Math.max(1, +val("tb_seats") || 1);
+  const locked = document.getElementById("tb_locked").checked;
+  await mutate(() => {
+    if (!S.config.seatMap) S.config.seatMap = { tables: [] };
+    const tables = S.config.seatMap.tables;
+    const i = tables.findIndex((t) => t.id === id);
+    if (i >= 0) Object.assign(tables[i], { row, number, catId, tierId, seats, locked });
+    else {
+      const maxY = tables.reduce((m, tb) => Math.max(m, (tb.y ?? 0) + (tb.h ?? 3)), 0);
+      tables.push({ id: uid(), row, number, catId, tierId, seats, locked, x: 0, y: maxY, w: 3, h: 3 });
+    }
+  }, "actSet", t("addTable"));
+  closeSheet();
+  render();
+}
+async function deleteTable(id) {
+  await mutate(() => {
+    S.config.seatMap.tables = S.config.seatMap.tables.filter((t) => t.id !== id);
+  }, "actSet", t("del"));
+  closeSheet();
+  render();
+}
+function seatLegendHtml() {
+  return ["available", "sold", "sponsor", "guest"]
+    .map((k) => {
+      const label = t("legend" + k[0].toUpperCase() + k.slice(1));
+      return `<div style="display:flex;align-items:center;gap:6px"><span style="width:13px;height:13px;border-radius:50%;background:${SEAT_COLORS[k] || "#5a5a55"};box-shadow:inset 0 0 0 1px var(--line);display:inline-block;flex:none"></span><span class="hint">${label}</span></div>`;
+    })
+    .join("");
+}
+// cellPx = lebar 1 unit kolom grid dlm px SUNGGUHAN saat dirender (default
+// 100, sesuai asumsi tampilan normal) - dipakai utk menyusutkan ukuran
+// lingkaran kursi scr proporsional saat mejanya dirender lebih kecil dari
+// biasa (mis. halaman Kursi yg di-fit-kan ke tinggi layar, atau preview
+// template yg dipadatkan spy tidak perlu scroll horizontal)
+function tableCardHtml(tb, cellPx = 100) {
+  const n = tb.seats;
+  const radius = 38;
+  const scale = Math.max(0.35, Math.min(1, cellPx / 100));
+  const size = Math.max(12, Math.round(seatDotSize(n) * scale));
+  const fontSize = Math.max(8, seatDotFontSize(size));
+  const seatsHtml = Array.from({ length: n })
+    .map((_, i) => {
+      const angle = (360 / n) * i - 90;
+      const rad = (angle * Math.PI) / 180;
+      const cx = 50 + radius * Math.cos(rad);
+      const cy = 50 + radius * Math.sin(rad);
+      const sid = seatId(tb.id, i);
+      const status = seatStatusOf(tb, sid);
+      const v = seatDotVisual(status);
+      return `<button type="button" class="seat-dot" style="left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;font-size:${fontSize}px;background:${v.bg};border-color:${v.border};color:${v.color}" onclick="onSeatClick('${tb.id}',${i})" title="${esc(t("seatNumber", { table: tableLabel(tb), seat: i + 1 }))} · ${esc(tableCatLabel(tb))}">${i + 1}</button>`;
+    })
+    .join("");
+  return `<div class="seat-table" style="grid-column:${(tb.x ?? 0) + 1} / span ${Math.min(tb.w ?? 3, SEATMAP_COLS)};grid-row:${(tb.y ?? 0) + 1} / span ${tb.h ?? 3}" title="${esc(tableCatLabel(tb))}">
+    <div class="seat-table-center${tb.locked ? " seat-table-locked" : ""}">${tb.locked ? "🔒" : tableLabel(tb)}</div>
+    ${seatsHtml}
+  </div>`;
+}
+// versi meja saat mode "atur tata letak" - tampilan sama persis (WYSIWYG,
+// admin lihat bentuk denah sungguhan sambil menggeser), tapi kursi jadi
+// <div> biasa (bukan <button onclick>) spy tidak ada booking tersenggol
+// tanpa sengaja pas menggeser/klik meja
+function tableArrangeTileHtml(tb) {
+  const n = tb.seats;
+  const radius = 38;
+  const size = seatDotSize(n);
+  const fontSize = seatDotFontSize(size);
+  const seatsHtml = Array.from({ length: n })
+    .map((_, i) => {
+      const angle = (360 / n) * i - 90;
+      const rad = (angle * Math.PI) / 180;
+      const cx = 50 + radius * Math.cos(rad);
+      const cy = 50 + radius * Math.sin(rad);
+      const status = seatStatusOf(tb, seatId(tb.id, i));
+      const v = seatDotVisual(status);
+      return `<div class="seat-dot static" style="left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;font-size:${fontSize}px;background:${v.bg};border-color:${v.border};color:${v.color};cursor:default">${i + 1}</div>`;
+    })
+    .join("");
+  return `<div class="grid-stack-item" gs-id="${tb.id}" gs-x="${tb.x ?? 0}" gs-y="${tb.y ?? 0}" gs-w="${tb.w ?? 3}" gs-h="${tb.h ?? 3}">
+    <div class="grid-stack-item-content">
+      <div class="seat-table" title="${esc(tableCatLabel(tb))}">
+        <div class="seat-table-center${tb.locked ? " seat-table-locked" : ""}">${tb.locked ? "🔒" : tableLabel(tb)}</div>
+        ${seatsHtml}
+      </div>
+    </div>
+  </div>`;
+}
+function seatSelectionBarHtml() {
+  if (!seatSelection?.seats.length) return "";
+  const tb = findTable(seatSelection.tableId);
+  const price = tablePrice(tb);
+  const total = price * seatSelection.seats.length;
+  const list = seatSelection.seats
+    .slice()
+    .sort((a, b) => a - b)
+    .map((i) => `${tableLabel(tb)}-${i + 1}`)
+    .join(", ");
+  return `<div class="seat-selbar">
+    <div style="min-width:0;flex:1">
+      <div style="font-weight:700">${t("seatsSelected", { n: seatSelection.seats.length })}</div>
+      <div class="hint" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(list)}</div>
+    </div>
+    <div class="mono" style="font-weight:700;flex:none">${rp(total)}</div>
+    <button class="btn ghost sm" onclick="cancelSeatSelection()">${t("cancelSelection")}</button>
+    <button class="btn sm" onclick="openSeatBookingConfirm()">${t("continueToConfirm")}</button>
+  </div>`;
+}
+function vSeatMap() {
+  const sm = D().seatMap;
+  if (!sm?.tables?.length)
+    return `<div class="fit" style="align-items:center;justify-content:center;text-align:center">
+      <div class="empty">${t("noSeatMapYet")}${isAdmin() ? `<br><button class="btn sm" style="margin-top:10px" onclick="goSeatMapEditor()">${t("editSeatMap")}</button>` : ""}</div></div>`;
+  const arranging = isAdmin() && seatMapArrangeMode;
+  const toolbar = !isAdmin()
+    ? ""
+    : arranging
+      ? `<div class="rowsp" style="margin-bottom:20px;flex-wrap:wrap;gap:8px">
+        <p class="hint" style="margin:0">${t("arrangeModeHint")}</p>
+        <div style="display:flex;gap:8px;flex:none">
+          <button class="btn ghost sm" onclick="cancelSeatMapArrange()">${t("cancelSelection")}</button>
+          <button class="btn sm" onclick="saveSeatMapLayout()">${t("saveLayout")}</button>
+        </div>
+      </div>`
+      : `<div class="rowsp" style="margin-bottom:20px"><span></span><button class="btn ghost sm" onclick="toggleSeatMapArrange()">${t("arrangeLayout")}</button></div>`;
+  // meja bebas ada di kolom manapun dari 12 kolom kanvas - tapi utk TAMPILAN
+  // (bukan mode atur), cuma render sejumlah kolom yg benar2 dipakai lalu
+  // pusatkan blok itu, spy tidak ada sisa ruang kosong besar di kanan yg
+  // bikin denah terlihat "nempel kiri"/tidak seimbang dgn lebar penuh
+  // banner panggung di atasnya
+  const usedCols = Math.max(
+    6,
+    Math.min(SEATMAP_COLS, sm.tables.reduce((m, tb) => Math.max(m, (tb.x ?? 0) + (tb.w ?? 3)), 0)),
+  );
+  // === mode LIHAT (bukan atur): "fit-to-viewport" - hitung ukuran 1 unit
+  // grid (cellPx) spy SELURUH meja+kursi muat dlm tinggi & lebar layar
+  // tanpa perlu scroll, lalu susutkan ukuran lingkaran kursi proporsional
+  // (lihat parameter cellPx di tableCardHtml). CHROME_H adalah taksiran
+  // tinggi semua elemen di luar grid (header, nav, toolbar, panggung,
+  // legend, padding) + cadangan utk seat-selbar mengambang saat kursi
+  // dipilih - kalau taksiran ini meleset dikit di device tertentu, masih
+  // ada floor 46px spy kursi tidak sampai tak terbaca; utk denah yg SANGAT
+  // besar/tinggi, scroll tetap muncul drpd kursi mengecil tak jelas.
+  // Perubahan ini SENGAJA diisolasi hanya di sini (cabang non-arranging)
+  // spy gampang di-revert ke versi ukuran tetap (COL_PX=100) kalau perlu.
+  let gridHtml;
+  if (arranging) {
+    gridHtml = `<div class="grid-stack" id="seatMapGrid" style="min-width:820px">${sm.tables.map(tableArrangeTileHtml).join("")}</div>`;
+  } else {
+    const usedRows = Math.max(1, sm.tables.reduce((m, tb) => Math.max(m, (tb.y ?? 0) + (tb.h ?? 3)), 0));
+    const gap = 16;
+    const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    const CHROME_W = 64; // padding .wrap + padding dalam .seat-venue, kiri+kanan
+    const CHROME_H = 56 + 66 + 16 + 40 + (isAdmin() ? 60 : 0) + 62 + 28 + 48 + 50;
+    const availW = Math.max(260, Math.min(vw, 1500) - CHROME_W);
+    const availH = Math.max(200, vh - CHROME_H);
+    const colPxFit = Math.floor((availW - gap * (usedCols - 1)) / usedCols);
+    const rowPxFit = Math.floor((availH - gap * (usedRows - 1)) / usedRows);
+    const cellPx = Math.max(46, Math.min(130, colPxFit, rowPxFit));
+    gridHtml = `<div class="grid" style="grid-template-columns:repeat(${usedCols},${cellPx}px);grid-auto-rows:${cellPx}px;gap:${gap}px;width:${usedCols * cellPx + (usedCols - 1) * gap}px;max-width:100%;margin:0 auto">
+      ${sm.tables.map((tb) => tableCardHtml(tb, cellPx)).join("")}
+    </div>`;
+  }
+  // mode LIHAT: bungkus seat-venue jadi flex-column setinggi SISA layar
+  // (persis rumus .fit - lihat style.css) - toolbar/panggung/legend flex:none
+  // (SELALU kelihatan, tak pernah kepotong), area grid-nya sendiri flex:1
+  // dgn overflow:auto sbg jaring pengaman kalau taksiran cellPx di atas
+  // masih kurang pas utk denah yg sangat besar (scroll cuma di situ, bukan
+  // seluruh halaman - legend & toolbar tetap kepegang di tempatnya)
+  const venueStyle = arranging
+    ? ""
+    : `style="display:flex;flex-direction:column;height:calc(100dvh - var(--hdr) - env(safe-area-inset-top) - var(--nav) - env(safe-area-inset-bottom) - var(--banner) - 16px)"`;
+  const innerStyle = arranging ? `style="padding:24px 16px 130px"` : `style="padding:24px 16px 16px;display:flex;flex-direction:column;flex:1;min-height:0"`;
+  const gridWrapStyle = arranging ? `style="overflow-x:auto;padding:24px 4px 4px"` : `style="overflow:auto;flex:1 1 auto;min-height:0;padding:24px 4px 4px"`;
+  return `<div class="seat-venue" ${venueStyle}>
+    <div ${innerStyle}>
+      ${toolbar}
+      <div class="seat-stage" style="flex:none">${t("stage")}</div>
+      <div ${gridWrapStyle}>
+        ${gridHtml}
+      </div>
+      <div class="rowsp" style="justify-content:center;gap:18px;flex-wrap:wrap;margin:20px 0 4px;flex:none">${seatLegendHtml()}</div>
+    </div>
+  </div>
+  ${arranging ? "" : `<div id="seatSelBarWrap">${seatSelectionBarHtml()}</div>`}`;
+}
+function goSeatMapEditor() {
+  tab = "admin";
+  adminTab = "seatmap";
+  render();
+}
+function onSeatClick(tableId, seatIdx) {
+  const tb = findTable(tableId);
+  if (!tb || tb.locked) return;
+  const sid = seatId(tableId, seatIdx);
+  const existing = txForSeat(sid);
+  if (existing) {
+    openTx(existing.id);
+    return;
+  }
+  if (!canEdit()) return;
+  if (!seatSelection || seatSelection.tableId !== tableId) seatSelection = { tableId, seats: [] };
+  const i = seatSelection.seats.indexOf(seatIdx);
+  if (i >= 0) seatSelection.seats.splice(i, 1);
+  else seatSelection.seats.push(seatIdx);
+  if (!seatSelection.seats.length) seatSelection = null;
+  render();
+}
+function cancelSeatSelection() {
+  seatSelection = null;
+  render();
+}
+function openSeatBookingConfirm() {
+  const tb = findTable(seatSelection.tableId);
+  const seats = seatSelection.seats.slice().sort((a, b) => a - b);
+  const price = tablePrice(tb);
+  const total = price * seats.length;
+  const seatList = seats.map((i) => `${tableLabel(tb)}-${i + 1}`).join(", ");
+  sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:19px">${t("continueToConfirm")}</h2>${closeBtn()}</div>
+    <div class="field"><label>${t("txCat")}</label><input value="${esc(tableCatLabel(tb))}" disabled></div>
+    <div class="field"><label>${t("selectedSeatsLbl")}</label><input value="${esc(seatList)}" disabled></div>
+    <div class="field"><label>${t("allocType")}</label><select id="sb_alloc" onchange="onAllocTypeChange()">
+      <option value="sold">${t("allocSold")}</option>
+      <option value="sponsor">${t("allocSponsor")}</option>
+      <option value="guest">${t("allocGuest")}</option>
+    </select></div>
+    <div class="field"><label>${t("nameGeneric")} <span class="req">*</span></label><input id="sb_name"></div>
+    <div class="field"><label>${t("wa")}</label><input id="sb_phone" inputmode="tel" placeholder="0812..."></div>
+    <div id="sb_pay_wrap">
+      <div class="grid" style="grid-template-columns:1fr 1fr">
+        <div class="field"><label id="sb_l_bank">${t("paymentMethod")} <span class="req">*</span></label><select id="sb_bank" onchange="onSeatBankChange()">${D()
+          .methods.map((m) => `<option value="${esc(m.name)}" data-type="${m.type}">${esc(m.name)}</option>`)
+          .join("")}</select></div>
+        <div class="field" id="sb_w_bankName" style="display:none"><label>${t("bankNameLbl")}</label><select id="sb_bankName">${INDONESIA_BANKS.map((b) => `<option>${esc(b)}</option>`).join("")}</select></div>
+      </div>
+      <div class="field amt-field"><label id="sb_l_amount">${t("amtIn")} <span class="req">*</span></label><input type="number" inputmode="numeric" id="sb_amount" value="${total}">
+        <div class="hint mono" style="margin-top:4px">${t("seatPriceEach", { p: rp(price) })}</div></div>
+      <div class="field"><label>${t("payStatus")}</label><select id="sb_status">
+        <option value="verified">${t("stV")}</option>
+        <option value="pending">${t("stW")}</option>
+      </select></div>
+    </div>
+    <div class="field"><label>${t("note")}</label><textarea id="sb_note" rows="2"></textarea></div>
+    <div class="rowsp" style="margin-top:14px"><span></span><button class="btn" onclick="submitSeatBooking()">${t("save")}</button></div>`);
+  initCombobox("sb_bankName");
+  onSeatBankChange();
+}
+function onAllocTypeChange() {
+  const isSold = document.getElementById("sb_alloc").value === "sold";
+  document.getElementById("sb_pay_wrap").style.display = isSold ? "block" : "none";
+}
+function onSeatBankChange() {
+  const sel = document.getElementById("sb_bank");
+  const type = sel?.selectedOptions[0]?.dataset.type || "bank";
+  const wrap = document.getElementById("sb_w_bankName");
+  if (wrap) wrap.style.display = type === "bank" ? "block" : "none";
+  const lbl = document.getElementById("sb_l_amount");
+  if (lbl) lbl.innerHTML = `${amountLabelFor(type, false)} <span class="req">*</span>`;
+}
+async function submitSeatBooking() {
+  const tb = findTable(seatSelection.tableId);
+  const seats = seatSelection.seats.slice().sort((a, b) => a - b);
+  const allocType = document.getElementById("sb_alloc").value;
+  const isSold = allocType === "sold";
+  const name = val("sb_name");
+  if (!name) return toast(t("fillAll"));
+  const bankSel = document.getElementById("sb_bank");
+  const methodType = isSold ? bankSel?.selectedOptions[0]?.dataset.type || "bank" : "other";
+  const bank = isSold ? bankSel.value : D().methods[0]?.name || "";
+  const bankName = isSold && methodType === "bank" ? val("sb_bankName") : "";
+  const amount = isSold ? +val("sb_amount") || 0 : 0;
+  const status = isSold ? document.getElementById("sb_status").value : "verified";
+  if (isSold && !amount) return toast(t("needAmt"));
+  const cat = tableCat(tb);
+  const seatIds = seats.map((i) => seatId(tb.id, i));
+  const seatList = seats.map((i) => `${tableLabel(tb)}-${i + 1}`).join(", ");
+  const x = {
+    id: uid(),
+    type: "income",
+    date: today(),
+    name,
+    phone: val("sb_phone"),
+    cat: cat.n,
+    tier: tableTierName(tb),
+    seats: seats.length,
+    amount,
+    bank,
+    bankName,
+    methodType,
+    chequeNo: "",
+    chequeBank: "",
+    chequeDate: "",
+    note: val("sb_note"),
+    note2: "",
+    proof: "",
+    status,
+    by: acting().name,
+    custom: {},
+    seatIds,
+    allocType,
+  };
+  await mutate(
+    () => {
+      S.tx.push(x);
+    },
+    "actCreate",
+    `${x.name} · ${seatList}`,
+  );
+  seatSelection = null;
+  closeSheet();
+  toast(t("saved"));
+  render();
+}
+
 /* ================= transaksi ================= */
 function txMatches(x, q) {
   return (
@@ -3160,6 +4478,11 @@ function openTx(id) {
           <button type="button" class="step-btn" onclick="stepSeats(1)" aria-label="+">+</button>
         </div></div>
     </div>
+    <div class="grid" id="w_seatPick" style="display:none;grid-template-columns:1fr 1fr;margin-bottom:14px">
+      <div class="field"><label>${t("tableLbl")} <span class="req">*</span></label><select id="f_table" onchange="onSeatPickTableChange()"></select></div>
+      <div class="field"><label>${t("seatNosLbl")} <span class="req">*</span></label><input id="f_seatNos" placeholder="${t("seatNosPlaceholder")}" oninput="onSeatNosInput()">
+        <div class="hint" id="seatAvailHint" style="margin-top:4px"></div></div>
+    </div>
     <div class="grid" id="w_cheque" style="display:none;grid-template-columns:1fr 1fr 1fr">
       <div class="field"><label>${t("chequeNo")}</label><input id="f_chequeNo" value="${esc(x.chequeNo || "")}"></div>
       <div class="field"><label>${t("chequeBank")}</label><input id="f_chequeBank" value="${esc(x.chequeBank || "")}"></div>
@@ -3208,6 +4531,12 @@ function openTx(id) {
   }
 }
 function sheet(html) {
+  // beberapa alur (mis. pemilih alokasi kursi -> form booking) memanggil
+  // sheet() lagi dari dalam sheet yg sedang terbuka tanpa closeSheet()
+  // eksplisit dulu - kalau modal lama dibiarkan, id="modal" jadi dobel dan
+  // closeSheet() (getElementById, cuma nemu yg PERTAMA) bisa menghapus yg
+  // salah, menyisakan overlay tak kasat mata yg tetap memblokir klik
+  document.querySelectorAll("#modal").forEach((el) => el.remove());
   const m = document.createElement("div");
   m.className = "modal";
   m.id = "modal";
@@ -3288,7 +4617,31 @@ function viewProofById(id) {
 // kategori ke grup yg aktif, jadi admin tak perlu menyisir daftar gabungan
 function catOptionHtml(c) {
   const tiersJson = esc(JSON.stringify(c.tiers || [])).replace(/'/g, "&#39;");
-  return `<option value="${esc(c.n)}" data-qty="${c.hasQty ? 1 : 0}" data-price="${c.p || 0}" data-tiers='${tiersJson}'>${esc(c.n)}</option>`;
+  return `<option value="${esc(c.n)}" data-id="${c.id}" data-qty="${c.hasQty ? 1 : 0}" data-price="${c.p || 0}" data-tiers='${tiersJson}'>${esc(c.n)}</option>`;
+}
+// meja denah kursi yg dipakai kategori (+tingkat tertentu, kalau kategorinya
+// bertingkat) ini - dipakai form transaksi biasa (bukan cuma lewat halaman
+// Kursi) spy treasurer bisa catat pembelian kursi SPESIFIK (bukan cuma
+// jumlahnya) tanpa harus buka Seats page
+function catSeatTables(catId, tierName) {
+  const cat = D().cats.find((c) => c.id === catId);
+  if (!cat) return [];
+  const tierId = cat.tiers?.length ? cat.tiers.find((tr) => tr.name === tierName)?.id : "";
+  return (D().seatMap?.tables || []).filter(
+    (tb) => tb.catId === catId && (!cat.tiers?.length || tb.tierId === tierId),
+  );
+}
+function parseSeatNos(v) {
+  return [
+    ...new Set(
+      String(v || "")
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(Number)
+        .filter((n) => Number.isInteger(n) && n > 0),
+    ),
+  ];
 }
 function setTxTab(group, x) {
   document
@@ -3331,7 +4684,8 @@ function onCatChange(init, x) {
   // barisnya - bentangkan penuh 2 kolom biar tidak kelihatan terpotong separuh
   document.getElementById("w_name").style.gridColumn = e ? "1 / -1" : "";
   document.getElementById("l_name").innerHTML = `${e ? t("namePay") : t("nameGeneric")} <span class="req">*</span>`;
-  if (!init) {
+  const seatPickActive = refreshSeatPickUI(init, x);
+  if (!init && !seatPickActive) {
     if (hasQty) recalc();
     else {
       const price = tiers.length ? +tiers[0]?.p || 0 : +(opt?.dataset.price || 0);
@@ -3345,7 +4699,67 @@ function onCatChange(init, x) {
   updateBonusHint();
 }
 function onTierChange() {
-  recalc();
+  if (!refreshSeatPickUI(false)) recalc();
+}
+// kategori yg dipakai 1+ meja di denah kursi - ganti stepper jumlah kursi
+// polos dgn pilih Meja + Nomor Kursi SPESIFIK, spy transaksi yg dicatat
+// lewat form biasa ini (bukan lewat klik langsung di halaman Kursi) tetap
+// terhubung ke seatIds & memengaruhi status kursi di denah. Return true
+// kalau mode ini aktif (dipakai onCatChange/onTierChange spy tidak dobel
+// menghitung ulang nominal lewat recalc() versi lama).
+function refreshSeatPickUI(init, x) {
+  const opt = document.getElementById("f_cat")?.selectedOptions[0];
+  const catId = opt?.dataset.id;
+  const tierWrap = document.getElementById("w_tier");
+  const tierName = tierWrap.style.display !== "none" ? document.getElementById("f_tier")?.value : "";
+  const tables = catId ? catSeatTables(catId, tierName) : [];
+  const wrap = document.getElementById("w_seatPick");
+  if (!tables.length) {
+    wrap.style.display = "none";
+    return false;
+  }
+  document.getElementById("w_seats").style.display = "none";
+  wrap.style.display = "grid";
+  const tableSel = document.getElementById("f_table");
+  const wantTableId = init && x?.seatIds?.length ? x.seatIds[0].split(":")[0] : tableSel.value;
+  tableSel.innerHTML = tables
+    .map((tb) => `<option value="${tb.id}">${esc(tableLabel(tb))}${tb.locked ? ` (${t("tableLocked")})` : ""}</option>`)
+    .join("");
+  tableSel.value = tables.some((tb) => tb.id === wantTableId) ? wantTableId : tables[0].id;
+  document.getElementById("f_seatNos").value = init && x?.seatIds?.length ? x.seatIds.map((sid) => +sid.split(":")[1] + 1).join(",") : "";
+  onSeatPickTableChange();
+  return true;
+}
+function onSeatPickTableChange() {
+  const tb = findTable(document.getElementById("f_table")?.value);
+  const hintEl = document.getElementById("seatAvailHint");
+  if (!tb) {
+    hintEl.textContent = "";
+    return;
+  }
+  const myId = val("f_id");
+  const taken = [];
+  for (let i = 0; i < tb.seats; i++) {
+    const owner = txForSeat(seatId(tb.id, i));
+    if (owner && owner.id !== myId) taken.push(i + 1);
+  }
+  hintEl.textContent = taken.length ? t("seatsTakenHint", { list: taken.join(", ") }) : t("seatsAllFreeHint");
+  onSeatNosInput();
+}
+function onSeatNosInput() {
+  const tb = findTable(document.getElementById("f_table")?.value);
+  if (!tb) return;
+  const nos = parseSeatNos(val("f_seatNos"));
+  document.getElementById("f_amount").value = nos.length * tablePrice(tb);
+  prev();
+}
+function seatNosValid(tb, nos, myId) {
+  if (!tb || !nos.length) return false;
+  return nos.every((n) => {
+    if (n < 1 || n > tb.seats) return false;
+    const owner = txForSeat(seatId(tb.id, n - 1));
+    return !owner || owner.id === myId;
+  });
 }
 // hint informasional (bukan otomatis mencatat transaksi baru) - kalau
 // kategori yg dipilih (mis. Sponsor) punya bonusRules dan nominalnya
@@ -3506,6 +4920,12 @@ function invalidTxFields() {
   if (!g("bank")) bad.push("f_bank");
   if (methodType === "bank" && !g("bankName")) bad.push("f_bankName");
   if (!(+g("amount") > 0)) bad.push("f_amount");
+  const seatPickWrap = document.getElementById("w_seatPick");
+  if (seatPickWrap && seatPickWrap.style.display !== "none") {
+    const tb = findTable(g("table"));
+    const nos = parseSeatNos(g("seatNos"));
+    if (!seatNosValid(tb, nos, g("id"))) bad.push("f_seatNos");
+  }
   return bad;
 }
 async function saveTx() {
@@ -3525,6 +4945,16 @@ async function saveTx() {
     ty = document.querySelector("#txTabs button.on")?.dataset.g || "income",
     hasQty = catOpt?.dataset.qty === "1",
     tiers = catOpt?.dataset.tiers ? JSON.parse(catOpt.dataset.tiers) : [];
+  const seatPickWrap = document.getElementById("w_seatPick");
+  const seatPickActive = seatPickWrap && seatPickWrap.style.display !== "none";
+  let seatIds, seats = hasQty ? +g("seats") || 0 : 0;
+  if (seatPickActive) {
+    const tb = findTable(g("table"));
+    seatIds = parseSeatNos(g("seatNos"))
+      .sort((a, b) => a - b)
+      .map((n) => seatId(tb.id, n - 1));
+    seats = seatIds.length;
+  }
   const x = {
     id: id || uid(),
     type: ty,
@@ -3533,7 +4963,7 @@ async function saveTx() {
     phone: ty === "expense" ? "" : g("phone"),
     cat: g("cat"),
     tier: tiers.length ? g("tier") : "",
-    seats: hasQty ? +g("seats") || 0 : 0,
+    seats,
     amount: +g("amount") || 0,
     bank: g("bank"),
     bankName: methodType === "bank" ? g("bankName") : "",
@@ -3554,6 +4984,7 @@ async function saveTx() {
           (document.getElementById("fc_" + c.f)?.value || "").trim(),
         ]),
     ),
+    ...(seatIds ? { seatIds } : {}),
   };
   await mutate(
     () => {
@@ -3628,13 +5059,14 @@ function vAdmin() {
       ["logs", t("logs")],
       ["set", t("set")],
       ["dashboard", t("dashboardTab")],
+      ["seatmap", t("seatMapTab")],
     ]
       .map(
         ([k, l]) =>
           `<button class="${adminTab === k ? "on" : ""}" onclick="setAdminTab('${k}')">${l}</button>`,
       )
       .join("")}</div>
-    ${{ logs: vLogs, set: vSet, dashboard: vDashEditor }[adminTab]()}</div>`;
+    ${{ logs: vLogs, set: vSet, dashboard: vDashEditor, seatmap: vSeatMapEditor }[adminTab]()}</div>`;
 }
 function hubStaffListHtml() {
   const q = hubStaffQ.toLowerCase();
@@ -3751,7 +5183,7 @@ function openUser(email) {
       <div class="field"><label>${t("status")}</label><select id="v_active">
         <option value="1" ${u.active ? "selected" : ""}>${t("active")}</option>
         <option value="0" ${!u.active ? "selected" : ""}>${t("inactive")}</option></select></div></div>
-    <div class="field"><label>${email ? t("newPass") : t("pass")}</label><input id="v_pass" type="password" placeholder="${email ? "—" : ""}"></div>
+    <div class="field"><label>${email ? t("newPass") : t("pass")}</label><div class="pw"><input id="v_pass" type="password" placeholder="${email ? "—" : ""}"><button type="button" class="eye" onclick="toggleEye(this)">${eyeOn}</button></div></div>
     <div class="field" id="v_events_wrap" style="${u.role === "admin" ? "display:none" : ""}">
       <label>${t("events")}</label>
       <div class="chips" id="v_events">${
@@ -4287,6 +5719,17 @@ function cellValue(x, c, no) {
   if (c.f === "no") return no;
   if (c.f === "type") return { income: t("incomeW"), expense: t("expW") }[x.type];
   if (c.f === "cat") return catLabel(x);
+  if (c.f === "table") {
+    const tb = x.seatIds?.length ? findTable(x.seatIds[0].split(":")[0]) : null;
+    return tb ? tableLabel(tb) : "";
+  }
+  if (c.f === "seatNos")
+    return x.seatIds?.length
+      ? x.seatIds
+          .map((sid) => +sid.split(":")[1] + 1)
+          .sort((a, b) => a - b)
+          .join(", ")
+      : "";
   if (c.f === "debit") return x.type === "expense" ? null : x.amount;
   if (c.f === "credit") return x.type === "expense" ? x.amount : null;
   if (c.f === "status") return x.status === "verified" ? t("inRek") : t("stW");
@@ -4398,6 +5841,8 @@ async function dlTemplate() {
   const bankIdx = cols.findIndex((c) => c.f === "bank");
   const bankNameIdx = cols.findIndex((c) => c.f === "bankName");
   const phoneIdx = cols.findIndex((c) => c.f === "phone");
+  const tableIdx = cols.findIndex((c) => c.f === "table");
+  const seatNosIdx = cols.findIndex((c) => c.f === "seatNos");
   const tieredCats = cats.filter((c) => c.tiers?.length);
 
   const exCat = tieredCats[0] || cats.find((c) => c.group === "income" && !c.hasQty) || cats[0];
@@ -4488,6 +5933,32 @@ async function dlTemplate() {
         note2Cell.note = id
           ? `Untuk kategori bertingkat: isi jumlah kursi yang dibeli (angka). Kategori lain: catatan tambahan bebas.`
           : `For tiered categories: enter the number of seats purchased. Other categories: free additional note.`;
+      }
+    }
+    // kolom Meja/Nomor Kursi cuma relevan utk kategori yg dipakai denah
+    // kursi (mis. Pembelian Kursi) - dropdown daftar label meja (mis. A1,
+    // A2) bukan validasi ketat per-kategori (Excel tak gampang bikin
+    // dropdown dependen), tapi impor sungguhan (parseRows()) tetap
+    // memvalidasi meja itu cocok kategori+tingkat barisnya
+    const allSeatTables = D().seatMap?.tables || [];
+    if (allSeatTables.length && tableIdx >= 0) {
+      const tableLabels = [...new Set(allSeatTables.map((tb) => tableLabel(tb)))];
+      tableLabels.forEach((n, i) => (ref.getCell(i + 1, 4).value = n));
+      ws.dataValidations.add(`${colLetter(tableIdx)}2:${colLetter(tableIdx)}1000`, {
+        type: "list",
+        allowBlank: true,
+        showErrorMessage: false,
+        formulae: [`_ref!$D$1:$D$${tableLabels.length}`],
+      });
+      const note = ws.getCell(1, tableIdx + 1);
+      note.note = id
+        ? "Hanya untuk kategori yang dipakai denah kursi (mis. Pembelian Kursi). Isi label meja (mis. A1). Kategori lain: kosongkan."
+        : "Only for categories used by the seat map (e.g. Seat Purchase). Enter the table label (e.g. A1). Other categories: leave blank.";
+      if (seatNosIdx >= 0) {
+        const seatNosNote = ws.getCell(1, seatNosIdx + 1);
+        seatNosNote.note = id
+          ? "Nomor kursi di meja tsb, pisahkan dgn koma (mis. 1,3,5). Harus diisi bersamaan dgn kolom Meja."
+          : "Seat numbers at that table, comma-separated (e.g. 1,3,5). Must be filled together with the Table column.";
       }
     }
   }
@@ -4700,6 +6171,24 @@ function parseRows(rows) {
       // bukan dari Keterangan Tambahan (yg cuma dipakai utk kategori bertingkat)
       seats = normNum(get(r, "seats"));
     }
+    // kategori yg terhubung ke denah kursi - coba resolve kolom Meja/Nomor
+    // Kursi jadi seatIds SPESIFIK; kalau kolomnya tak ada/tak cocok (mis.
+    // file impor lama sblm fitur ini ada), tetap lanjut TANPA seatIds,
+    // pakai hitungan seats polos di atas spy impor lama tak rusak
+    const seatTables = catSeatTables(matchedCat.id, tier);
+    let seatIds;
+    if (seatTables.length) {
+      const tableRaw = String(get(r, "table") || "").trim();
+      const seatNosRaw = String(get(r, "seatNos") || "").trim();
+      const matchedTable = seatTables.find((tb) => tableLabel(tb).toLowerCase() === tableRaw.toLowerCase());
+      if (matchedTable && seatNosRaw) {
+        const nos = parseSeatNos(seatNosRaw).filter((n) => n >= 1 && n <= matchedTable.seats);
+        if (nos.length) {
+          seatIds = nos.map((n) => seatId(matchedTable.id, n - 1));
+          seats = seatIds.length;
+        }
+      }
+    }
     const custom = {};
     customCols.forEach((c) => {
       custom[c.f] = String(get(r, c.f) || "");
@@ -4726,6 +6215,7 @@ function parseRows(rows) {
       status: st,
       by: acting().name,
       custom,
+      ...(seatIds ? { seatIds } : {}),
     });
   });
   const lbl = { income: t("incomeW"), expense: t("expW") };
@@ -4996,7 +6486,7 @@ Object.assign(window, {
   createFirst,
   doSignIn,
   doSignUp,
-  doGoogle,
+  doGoogleFallback,
   doForgot,
   doSignOut,
   googleFlow,
@@ -5039,6 +6529,8 @@ Object.assign(window, {
   updateBonusHint,
   recalc,
   stepSeats,
+  onSeatPickTableChange,
+  onSeatNosInput,
   prev,
   onProofChange,
   viewProof,
@@ -5065,6 +6557,11 @@ Object.assign(window, {
   toggleArchive,
   deleteEventPermanent,
   loadMonitor,
+  loadSessionsView,
+  forceLogoutSession,
+  setSessionsPage,
+  setSessionsFilter,
+  onSessionsSearch,
   goDashEditor,
   openWidgetForm,
   onWidgetTypeChange,
@@ -5078,6 +6575,25 @@ Object.assign(window, {
   submitWidgetForm,
   deleteDashWidget,
   saveDashLayout,
+  goSeatMapEditor,
+  openTableForm,
+  onTableCatChange,
+  submitTableForm,
+  deleteTable,
+  saveSeatMapLayout,
+  openTemplatePicker,
+  setTemplatePickerPage,
+  previewSeatTemplate,
+  onTemplateCatChange,
+  applySeatTemplate,
+  toggleSeatMapArrange,
+  cancelSeatMapArrange,
+  onSeatClick,
+  cancelSeatSelection,
+  openSeatBookingConfirm,
+  onAllocTypeChange,
+  onSeatBankChange,
+  submitSeatBooking,
   saveSet,
   editCat,
   editTpl,
