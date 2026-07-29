@@ -18,6 +18,11 @@ async function loadGridstack() {
   }
   return _GridStack;
 }
+let _jsPDF = null;
+async function loadJsPDF() {
+  if (!_jsPDF) _jsPDF = (await import("jspdf")).jsPDF;
+  return _jsPDF;
+}
 
 // GANTI dgn Client ID asli dari Google Cloud Console (Credentials -> OAuth
 // Client ID -> Web application), dgn URL produksi didaftarkan sbg
@@ -1091,6 +1096,10 @@ const L = {
     seatNosPlaceholder: "cth: A,C,E",
     seatsAtTablesLbl: "Kursi per Meja",
     addAnotherTable: "+ Tambah Meja",
+    exportPNG: "Unduh PNG",
+    exportPDF: "Unduh PDF",
+    seatMapExported: "Denah kursi diunduh",
+    updatedAt: "Diperbarui",
     seatsTakenHint: "Kursi terisi: {list}",
     seatsAllFreeHint: "Semua kursi tersedia",
   },
@@ -1462,6 +1471,10 @@ const L = {
     seatNosPlaceholder: "e.g. A,C,E",
     seatsAtTablesLbl: "Seats per Table",
     addAnotherTable: "+ Add Table",
+    exportPNG: "Download PNG",
+    exportPDF: "Download PDF",
+    seatMapExported: "Seat chart downloaded",
+    updatedAt: "Updated",
     seatsTakenHint: "Taken seats: {list}",
     seatsAllFreeHint: "All seats available",
   },
@@ -4018,6 +4031,190 @@ function seatLegendHtml() {
     })
     .join("");
 }
+/* ================= ekspor denah kursi (PNG/PDF) ================= */
+// snapshot kondisi kursi SAAT INI (siapa yg sudah terjual/tersedia dst)
+// utk dibagikan/dicetak - gambar digambar manual di <canvas> (bukan
+// html2canvas dari DOM) spy tak perlu dependency tambahan yg berat & hasil
+// tetap konsisten terlepas dari tema gelap/terang yg sedang aktif di layar
+// (ekspor SELALU terang, krn tujuannya dibagikan/dicetak ke orang lain).
+function seatDotFillColor(status) {
+  if (status === "available") return { fill: "#ffffff", stroke: "#c9c6be", text: "#6b6860" };
+  return { fill: SEAT_COLORS[status] || "#5a5a55", stroke: "#ffffff", text: "#ffffff" };
+}
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function drawSeatMapCanvas() {
+  const tables = D().seatMap?.tables || [];
+  if (!tables.length) return null;
+  const usedCols = Math.max(1, tables.reduce((m, tb) => Math.max(m, (tb.x ?? 0) + (tb.w ?? 3)), 0));
+  const usedRows = Math.max(1, tables.reduce((m, tb) => Math.max(m, (tb.y ?? 0) + (tb.h ?? 3)), 0));
+  const CELL = 100,
+    GAP = 16,
+    PAD = 30,
+    TITLE_H = 44,
+    STAGE_H = 56,
+    LEGEND_H = 40;
+  const contentW = usedCols * CELL + (usedCols - 1) * GAP;
+  const contentH = usedRows * CELL + (usedRows - 1) * GAP;
+  const canvasW = contentW + PAD * 2;
+  const canvasH = PAD + TITLE_H + STAGE_H + 20 + contentH + 26 + LEGEND_H + PAD;
+  const scale = 2; // resolusi lebih tinggi drpd layar biasa spy tetap tajam saat dicetak
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(canvasW * scale);
+  canvas.height = Math.round(canvasH * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(scale, scale);
+
+  ctx.fillStyle = "#f3f1ec";
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#1a1a18";
+  ctx.font = "bold 20px Arial, sans-serif";
+  ctx.fillText(D().event || "", PAD, PAD + 8);
+  ctx.font = "13px Arial, sans-serif";
+  ctx.fillStyle = "#6b6860";
+  const dateStr = D().date
+    ? new Date(D().date + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", { day: "numeric", month: "long", year: "numeric" })
+    : "";
+  ctx.fillText(`${dateStr}${dateStr ? " · " : ""}${t("updatedAt")} ${new Date().toLocaleString(lang === "id" ? "id-ID" : "en-GB")}`, PAD, PAD + 26);
+
+  const stageY = PAD + TITLE_H;
+  const grad = ctx.createLinearGradient(0, stageY, 0, stageY + STAGE_H);
+  grad.addColorStop(0, "#2c2e33");
+  grad.addColorStop(1, "#111214");
+  ctx.fillStyle = grad;
+  roundRectPath(ctx, PAD, stageY, contentW, STAGE_H, 10);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 16px Arial, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(t("stage"), PAD + contentW / 2, stageY + STAGE_H / 2 + 1);
+
+  const gridTop = stageY + STAGE_H + 20;
+  tables.forEach((tb) => {
+    const w = tb.w ?? 3,
+      h = tb.h ?? 3;
+    const boxW = w * CELL + (w - 1) * GAP;
+    const boxH = h * CELL + (h - 1) * GAP;
+    const boxX = PAD + (tb.x ?? 0) * (CELL + GAP);
+    const boxY = gridTop + (tb.y ?? 0) * (CELL + GAP);
+    const d = Math.min(boxW, boxH);
+    const cx = boxX + boxW / 2;
+    const cy = boxY + boxH / 2;
+    const r = d / 2;
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#e2e0d9";
+    ctx.stroke();
+
+    const centerR = r * 0.48;
+    ctx.beginPath();
+    ctx.arc(cx, cy, centerR, 0, Math.PI * 2);
+    ctx.fillStyle = "#eeece6";
+    ctx.fill();
+    ctx.strokeStyle = "#e2e0d9";
+    ctx.stroke();
+    ctx.fillStyle = "#1a1a18";
+    ctx.font = `bold ${Math.max(11, Math.round(centerR * 0.5))}px Arial, sans-serif`;
+    ctx.fillText(tb.locked ? "🔒" : tableLabel(tb), cx, cy);
+
+    const n = tb.seats;
+    const seatR = r * 0.38;
+    const dotSize = Math.max(9, Math.min(17, Math.round(150 / n)));
+    for (let i = 0; i < n; i++) {
+      const angle = ((360 / n) * i - 90) * (Math.PI / 180);
+      const sx = cx + seatR * Math.cos(angle);
+      const sy = cy + seatR * Math.sin(angle);
+      const status = seatStatusOf(tb, seatId(tb.id, i));
+      const v = seatDotFillColor(status);
+      ctx.beginPath();
+      ctx.arc(sx, sy, dotSize, 0, Math.PI * 2);
+      ctx.fillStyle = v.fill;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = v.stroke;
+      ctx.stroke();
+      ctx.fillStyle = v.text;
+      ctx.font = `bold ${Math.max(7, Math.round(dotSize * 0.9))}px Arial, sans-serif`;
+      ctx.fillText(seatLetter(i), sx, sy);
+    }
+  });
+
+  const legendY = gridTop + contentH + 26;
+  const legendItems = [
+    ["available", t("legendAvailable")],
+    ["sold", t("legendSold")],
+    ["sponsor", t("legendSponsor")],
+    ["guest", t("legendGuest")],
+  ];
+  ctx.font = "13px Arial, sans-serif";
+  ctx.textAlign = "left";
+  const itemGap = 26,
+    dotR = 7;
+  const widths = legendItems.map(([, label]) => dotR * 2 + 6 + ctx.measureText(label).width);
+  const totalW = widths.reduce((a, b) => a + b, 0) + itemGap * (legendItems.length - 1);
+  let lx = PAD + (contentW - totalW) / 2;
+  legendItems.forEach(([status, label], i) => {
+    const v = seatDotFillColor(status);
+    ctx.beginPath();
+    ctx.arc(lx + dotR, legendY, dotR, 0, Math.PI * 2);
+    ctx.fillStyle = v.fill;
+    ctx.fill();
+    ctx.strokeStyle = v.stroke;
+    ctx.stroke();
+    ctx.fillStyle = "#3a3833";
+    ctx.fillText(label, lx + dotR * 2 + 6, legendY + 4);
+    lx += widths[i] + itemGap;
+  });
+
+  return canvas;
+}
+function seatMapExportFilename() {
+  return `Denah-Kursi-${(D().event || "acara").replace(/[^\w\- ]/g, "")}-${today()}`;
+}
+function exportSeatMapPNG() {
+  const canvas = drawSeatMapCanvas();
+  if (!canvas) return toast(t("noSeatMapYet"));
+  canvas.toBlob((blob) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${seatMapExportFilename()}.png`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast(t("seatMapExported"));
+  }, "image/png");
+}
+async function exportSeatMapPDF() {
+  const canvas = drawSeatMapCanvas();
+  if (!canvas) return toast(t("noSeatMapYet"));
+  const jsPDF = await loadJsPDF();
+  const w = canvas.width,
+    h = canvas.height;
+  const pdf = new jsPDF({ orientation: w >= h ? "landscape" : "portrait", unit: "px", format: [w, h] });
+  // JPEG dipakai KHUSUS di dalam PDF (bukan tombol Unduh PNG) - jsPDF
+  // menyimpan PNG apa adanya (bitmap nyaris tanpa kompresi tambahan, bisa
+  // jadi puluhan MB), sedangkan JPEG dikompres native olehnya. Latar
+  // gambar ini polos/kontras tinggi (bukan foto), jadi kualitas 0.92 tetap
+  // tajam tanpa artefak yg kentara sambil filenya jauh lebih kecil.
+  pdf.addImage(canvas.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, w, h);
+  pdf.save(`${seatMapExportFilename()}.pdf`);
+  toast(t("seatMapExported"));
+}
 // cellPx = lebar 1 unit kolom grid dlm px SUNGGUHAN saat dirender (default
 // 100, sesuai asumsi tampilan normal) - dipakai utk menyusutkan ukuran
 // lingkaran kursi scr proporsional saat mejanya dirender lebih kecil dari
@@ -4105,17 +4302,21 @@ function vSeatMap() {
     return `<div class="fit" style="align-items:center;justify-content:center;text-align:center">
       <div class="empty">${t("noSeatMapYet")}${isAdmin() ? `<br><button class="btn sm" style="margin-top:10px" onclick="goSeatMapEditor()">${t("editSeatMap")}</button>` : ""}</div></div>`;
   const arranging = isAdmin() && seatMapArrangeMode;
-  const toolbar = !isAdmin()
-    ? ""
-    : arranging
-      ? `<div class="rowsp" style="margin-bottom:20px;flex-wrap:wrap;gap:8px">
+  const toolbar = arranging
+    ? `<div class="rowsp" style="margin-bottom:20px;flex-wrap:wrap;gap:8px">
         <p class="hint" style="margin:0">${t("arrangeModeHint")}</p>
         <div style="display:flex;gap:8px;flex:none">
           <button class="btn ghost sm" onclick="cancelSeatMapArrange()">${t("cancelSelection")}</button>
           <button class="btn sm" onclick="saveSeatMapLayout()">${t("saveLayout")}</button>
         </div>
       </div>`
-      : `<div class="rowsp" style="margin-bottom:20px"><span></span><button class="btn ghost sm" onclick="toggleSeatMapArrange()">${t("arrangeLayout")}</button></div>`;
+    : `<div class="rowsp" style="margin-bottom:20px;flex-wrap:wrap;gap:8px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn ghost sm" onclick="exportSeatMapPNG()">${t("exportPNG")}</button>
+          <button class="btn ghost sm" onclick="exportSeatMapPDF()">${t("exportPDF")}</button>
+        </div>
+        ${isAdmin() ? `<button class="btn ghost sm" onclick="toggleSeatMapArrange()">${t("arrangeLayout")}</button>` : "<span></span>"}
+      </div>`;
   // meja bebas ada di kolom manapun dari 12 kolom kanvas - tapi utk TAMPILAN
   // (bukan mode atur), cuma render sejumlah kolom yg benar2 dipakai lalu
   // pusatkan blok itu, spy tidak ada sisa ruang kosong besar di kanan yg
@@ -6692,6 +6893,8 @@ Object.assign(window, {
   addSeatGroupRow,
   removeSeatGroupRow,
   onSeatGroupChange,
+  exportSeatMapPNG,
+  exportSeatMapPDF,
   prev,
   onProofChange,
   viewProof,
