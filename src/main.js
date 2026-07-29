@@ -1048,7 +1048,7 @@ const L = {
     legendSelected: "Dipilih",
     legendSold: "Terjual",
     legendSponsor: "Sponsor",
-    legendGuest: "Tamu",
+    legendGuest: "Gotilon",
     legendLocked: "Terkunci",
     seatNumber: "Meja {table} · Kursi {seat}",
     seatsSelected: "{n} kursi dipilih",
@@ -1059,7 +1059,7 @@ const L = {
     seatPriceEach: "{p} / kursi",
     allocSold: "Jual",
     allocSponsor: "Sponsor",
-    allocGuest: "Tamu",
+    allocGuest: "Gotilon",
     back: "Kembali",
     useTemplate: "Gunakan Template",
     layoutTemplates: "Template Tata Letak",
@@ -1088,7 +1088,7 @@ const L = {
     tplBanquetLong: "2 Baris dengan Lorong Tengah",
     tableLbl: "Meja",
     seatNosLbl: "Nomor Kursi",
-    seatNosPlaceholder: "cth: 1,3,5",
+    seatNosPlaceholder: "cth: A,C,E",
     seatsTakenHint: "Kursi terisi: {list}",
     seatsAllFreeHint: "Semua kursi tersedia",
   },
@@ -1417,7 +1417,7 @@ const L = {
     legendSelected: "Selected",
     legendSold: "Sold",
     legendSponsor: "Sponsor",
-    legendGuest: "Guest",
+    legendGuest: "Gotilon",
     legendLocked: "Locked",
     seatNumber: "Table {table} · Seat {seat}",
     seatsSelected: "{n} seats selected",
@@ -1428,7 +1428,7 @@ const L = {
     seatPriceEach: "{p} / seat",
     allocSold: "Sold",
     allocSponsor: "Sponsor",
-    allocGuest: "Guest",
+    allocGuest: "Gotilon",
     back: "Back",
     useTemplate: "Use Template",
     layoutTemplates: "Layout Templates",
@@ -1457,7 +1457,7 @@ const L = {
     tplBanquetLong: "2 Rows with Center Aisle",
     tableLbl: "Table",
     seatNosLbl: "Seat Numbers",
-    seatNosPlaceholder: "e.g. 1,3,5",
+    seatNosPlaceholder: "e.g. A,C,E",
     seatsTakenHint: "Taken seats: {list}",
     seatsAllFreeHint: "All seats available",
   },
@@ -3643,6 +3643,28 @@ let seatMapGrid = null;
 // digeser/diubah ukuran lewat gridstack, persis mode edit dashboard.
 let seatMapArrangeMode = false;
 const seatId = (tableId, i) => `${tableId}:${i}`;
+// label kursi pakai HURUF (A, B, ... Z, AA, AB, ...) bukan angka - seatId
+// penyimpanan internal (di atas) tetap index angka 0-based spy tak perlu
+// migrasi data lama, cuma TAMPILAN & input manual yg pakai huruf. Sama spt
+// penamaan kolom Excel (bijective base-26).
+function seatLetter(i) {
+  let n = i,
+    s = "";
+  do {
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return s;
+}
+function seatIndexFromLetter(v) {
+  const s = String(v || "")
+    .trim()
+    .toUpperCase();
+  if (!/^[A-Z]+$/.test(s)) return -1;
+  let n = 0;
+  for (const ch of s) n = n * 26 + (ch.charCodeAt(0) - 65) + 1;
+  return n - 1;
+}
 // ukuran lingkaran kursi dinamis thd jumlah kursi 1 meja - meja dgn sedikit
 // kursi dapat lingkaran besar (biar tidak ada gap kosong berlebihan di
 // sekeliling meja), meja dgn banyak kursi otomatis mengecil spy antar kursi
@@ -4012,7 +4034,7 @@ function tableCardHtml(tb, cellPx = 100) {
       const sid = seatId(tb.id, i);
       const status = seatStatusOf(tb, sid);
       const v = seatDotVisual(status);
-      return `<button type="button" class="seat-dot" style="left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;font-size:${fontSize}px;background:${v.bg};border-color:${v.border};color:${v.color}" onclick="onSeatClick('${tb.id}',${i})" title="${esc(t("seatNumber", { table: tableLabel(tb), seat: i + 1 }))} · ${esc(tableCatLabel(tb))}">${i + 1}</button>`;
+      return `<button type="button" class="seat-dot" style="left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;font-size:${fontSize}px;background:${v.bg};border-color:${v.border};color:${v.color}" onclick="onSeatClick('${tb.id}',${i})" title="${esc(t("seatNumber", { table: tableLabel(tb), seat: seatLetter(i) }))} · ${esc(tableCatLabel(tb))}">${seatLetter(i)}</button>`;
     })
     .join("");
   return `<div class="seat-table" style="grid-column:${(tb.x ?? 0) + 1} / span ${Math.min(tb.w ?? 3, SEATMAP_COLS)};grid-row:${(tb.y ?? 0) + 1} / span ${tb.h ?? 3}" title="${esc(tableCatLabel(tb))}">
@@ -4039,7 +4061,7 @@ function tableArrangeTileHtml(tb) {
       const cy = 50 + radius * Math.sin(rad);
       const status = seatStatusOf(tb, seatId(tb.id, i));
       const v = seatDotVisual(status);
-      return `<div class="seat-dot static" style="left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;font-size:${fontSize}px;background:${v.bg};border-color:${v.border};color:${v.color};cursor:default">${i + 1}</div>`;
+      return `<div class="seat-dot static" style="left:${cx}%;top:${cy}%;width:${size}px;height:${size}px;font-size:${fontSize}px;background:${v.bg};border-color:${v.border};color:${v.color};cursor:default">${seatLetter(i)}</div>`;
     })
     .join("");
   return `<div class="grid-stack-item" gs-id="${tb.id}" gs-x="${tb.x ?? 0}" gs-y="${tb.y ?? 0}" gs-w="${tb.w ?? 3}" gs-h="${tb.h ?? 3}">
@@ -4061,7 +4083,7 @@ function seatSelectionBarHtml() {
   const list = seatSelection.seats
     .slice()
     .sort((a, b) => a - b)
-    .map((i) => `${tableLabel(tb)}-${i + 1}`)
+    .map((i) => `${tableLabel(tb)}-${seatLetter(i)}`)
     .join(", ");
   return `<div class="seat-selbar">
     <div style="min-width:0;flex:1">
@@ -4183,7 +4205,7 @@ function openSeatBookingConfirm() {
   const seats = seatSelection.seats.slice().sort((a, b) => a - b);
   const price = tablePrice(tb);
   const total = price * seats.length;
-  const seatList = seats.map((i) => `${tableLabel(tb)}-${i + 1}`).join(", ");
+  const seatList = seats.map((i) => `${tableLabel(tb)}-${seatLetter(i)}`).join(", ");
   sheet(`<div class="rowsp" style="margin-bottom:14px"><h2 style="font-size:19px">${t("continueToConfirm")}</h2>${closeBtn()}</div>
     <div class="field"><label>${t("txCat")}</label><input value="${esc(tableCatLabel(tb))}" disabled></div>
     <div class="field"><label>${t("selectedSeatsLbl")}</label><input value="${esc(seatList)}" disabled></div>
@@ -4241,7 +4263,7 @@ async function submitSeatBooking() {
   if (isSold && !amount) return toast(t("needAmt"));
   const cat = tableCat(tb);
   const seatIds = seats.map((i) => seatId(tb.id, i));
-  const seatList = seats.map((i) => `${tableLabel(tb)}-${i + 1}`).join(", ");
+  const seatList = seats.map((i) => `${tableLabel(tb)}-${seatLetter(i)}`).join(", ");
   const x = {
     id: uid(),
     type: "income",
@@ -4658,6 +4680,8 @@ function catSeatTables(catId, tierName) {
     (tb) => tb.catId === catId && (!cat.tiers?.length || tb.tierId === tierId),
   );
 }
+// parse daftar huruf kursi (mis. "A,C,E") jadi index 0-based (bukan lagi
+// angka 1-based) - dipakai form input manual & impor Excel
 function parseSeatNos(v) {
   return [
     ...new Set(
@@ -4665,8 +4689,8 @@ function parseSeatNos(v) {
         .split(/[,\s]+/)
         .map((s) => s.trim())
         .filter(Boolean)
-        .map(Number)
-        .filter((n) => Number.isInteger(n) && n > 0),
+        .map(seatIndexFromLetter)
+        .filter((n) => n >= 0),
     ),
   ];
 }
@@ -4753,7 +4777,7 @@ function refreshSeatPickUI(init, x) {
     .map((tb) => `<option value="${tb.id}">${esc(tableLabel(tb))}${tb.locked ? ` (${t("tableLocked")})` : ""}</option>`)
     .join("");
   tableSel.value = tables.some((tb) => tb.id === wantTableId) ? wantTableId : tables[0].id;
-  document.getElementById("f_seatNos").value = init && x?.seatIds?.length ? x.seatIds.map((sid) => +sid.split(":")[1] + 1).join(",") : "";
+  document.getElementById("f_seatNos").value = init && x?.seatIds?.length ? x.seatIds.map((sid) => seatLetter(+sid.split(":")[1])).join(",") : "";
   onSeatPickTableChange();
   return true;
 }
@@ -4768,7 +4792,7 @@ function onSeatPickTableChange() {
   const taken = [];
   for (let i = 0; i < tb.seats; i++) {
     const owner = txForSeat(seatId(tb.id, i));
-    if (owner && owner.id !== myId) taken.push(i + 1);
+    if (owner && owner.id !== myId) taken.push(seatLetter(i));
   }
   hintEl.textContent = taken.length ? t("seatsTakenHint", { list: taken.join(", ") }) : t("seatsAllFreeHint");
   onSeatNosInput();
@@ -4783,8 +4807,8 @@ function onSeatNosInput() {
 function seatNosValid(tb, nos, myId) {
   if (!tb || !nos.length) return false;
   return nos.every((n) => {
-    if (n < 1 || n > tb.seats) return false;
-    const owner = txForSeat(seatId(tb.id, n - 1));
+    if (n < 0 || n >= tb.seats) return false;
+    const owner = txForSeat(seatId(tb.id, n));
     return !owner || owner.id === myId;
   });
 }
@@ -4979,7 +5003,7 @@ async function saveTx() {
     const tb = findTable(g("table"));
     seatIds = parseSeatNos(g("seatNos"))
       .sort((a, b) => a - b)
-      .map((n) => seatId(tb.id, n - 1));
+      .map((n) => seatId(tb.id, n));
     seats = seatIds.length;
   }
   const x = {
@@ -5753,8 +5777,9 @@ function cellValue(x, c, no) {
   if (c.f === "seatNos")
     return x.seatIds?.length
       ? x.seatIds
-          .map((sid) => +sid.split(":")[1] + 1)
+          .map((sid) => +sid.split(":")[1])
           .sort((a, b) => a - b)
+          .map(seatLetter)
           .join(", ")
       : "";
   if (c.f === "debit") return x.type === "expense" ? null : x.amount;
@@ -5984,8 +6009,8 @@ async function dlTemplate() {
       if (seatNosIdx >= 0) {
         const seatNosNote = ws.getCell(1, seatNosIdx + 1);
         seatNosNote.note = id
-          ? "Nomor kursi di meja tsb, pisahkan dgn koma (mis. 1,3,5). Harus diisi bersamaan dgn kolom Meja."
-          : "Seat numbers at that table, comma-separated (e.g. 1,3,5). Must be filled together with the Table column.";
+          ? "Huruf kursi di meja tsb, pisahkan dgn koma (mis. A,C,E). Harus diisi bersamaan dgn kolom Meja."
+          : "Seat letters at that table, comma-separated (e.g. A,C,E). Must be filled together with the Table column.";
       }
     }
   }
@@ -6209,9 +6234,9 @@ function parseRows(rows) {
       const seatNosRaw = String(get(r, "seatNos") || "").trim();
       const matchedTable = seatTables.find((tb) => tableLabel(tb).toLowerCase() === tableRaw.toLowerCase());
       if (matchedTable && seatNosRaw) {
-        const nos = parseSeatNos(seatNosRaw).filter((n) => n >= 1 && n <= matchedTable.seats);
+        const nos = parseSeatNos(seatNosRaw).filter((n) => n >= 0 && n < matchedTable.seats);
         if (nos.length) {
-          seatIds = nos.map((n) => seatId(matchedTable.id, n - 1));
+          seatIds = nos.map((n) => seatId(matchedTable.id, n));
           seats = seatIds.length;
         }
       }
