@@ -983,7 +983,7 @@ input[type="number"] {
   background: linear-gradient(180deg, var(--line2), var(--bg) 260px);
   border: 1px solid var(--line);
   border-radius: 16px;
-  margin-top: 16px;
+  margin: 16px 0;
 }
 .seat-table-center {
   width: 48%;

@@ -2066,7 +2066,12 @@ function googleFlow() {
       handled = true;
       clearTimeout(fallbackTimer);
       googleFlowFallback();
-    } else if (notification.isDismissedMoment?.()) {
+    } else if (notification.isDisplayed?.() || notification.isDismissedMoment?.()) {
+      // prompt Google ASLI berhasil tampil (atau sempat tampil lalu ditutup) -
+      // batalkan jaring pengaman waktu spy TIDAK menimpa dgn dialog fallback
+      // manual di atasnya. Tanpa ini, alur asli yg butuh waktu lebih lama dari
+      // 3.5dtk (mis. verifikasi 2FA/pilih perangkat) tetap kena timeout dan
+      // dialog fallback muncul nimpa di atas prompt Google yg sungguhan.
       handled = true;
       clearTimeout(fallbackTimer);
     }
@@ -4092,7 +4097,7 @@ function vSeatMap() {
     const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
     const vh = typeof window !== "undefined" ? window.innerHeight : 800;
     const CHROME_W = 64; // padding .wrap + padding dalam .seat-venue, kiri+kanan
-    const CHROME_H = 56 + 66 + 16 + 40 + (isAdmin() ? 60 : 0) + 62 + 28 + 48 + 50;
+    const CHROME_H = 56 + 66 + 32 + 40 + (isAdmin() ? 60 : 0) + 62 + 28 + 48 + 50;
     const availW = Math.max(260, Math.min(vw, 1500) - CHROME_W);
     const availH = Math.max(200, vh - CHROME_H);
     const colPxFit = Math.floor((availW - gap * (usedCols - 1)) / usedCols);
@@ -4110,7 +4115,7 @@ function vSeatMap() {
   // seluruh halaman - legend & toolbar tetap kepegang di tempatnya)
   const venueStyle = arranging
     ? ""
-    : `style="display:flex;flex-direction:column;height:calc(100dvh - var(--hdr) - env(safe-area-inset-top) - var(--nav) - env(safe-area-inset-bottom) - var(--banner) - 16px)"`;
+    : `style="display:flex;flex-direction:column;height:calc(100dvh - var(--hdr) - env(safe-area-inset-top) - var(--nav) - env(safe-area-inset-bottom) - var(--banner) - 32px)"`;
   const innerStyle = arranging ? `style="padding:24px 16px 130px"` : `style="padding:24px 16px 16px;display:flex;flex-direction:column;flex:1;min-height:0"`;
   const gridWrapStyle = arranging ? `style="overflow-x:auto;padding:24px 4px 4px"` : `style="overflow:auto;flex:1 1 auto;min-height:0;padding:24px 4px 4px"`;
   return `<div class="seat-venue" ${venueStyle}>
