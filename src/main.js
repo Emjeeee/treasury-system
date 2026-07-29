@@ -4038,8 +4038,8 @@ function seatLegendHtml() {
 // tetap konsisten terlepas dari tema gelap/terang yg sedang aktif di layar
 // (ekspor SELALU terang, krn tujuannya dibagikan/dicetak ke orang lain).
 function seatDotFillColor(status) {
-  if (status === "available") return { fill: "#ffffff", stroke: "#c9c6be", text: "#6b6860" };
-  return { fill: SEAT_COLORS[status] || "#5a5a55", stroke: "#ffffff", text: "#ffffff" };
+  if (status === "available") return { fill: "#ffffff", text: "#3a3833" };
+  return { fill: SEAT_COLORS[status] || "#5a5a55", text: "#ffffff" };
 }
 function roundRectPath(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -4072,28 +4072,34 @@ function drawSeatMapCanvas() {
   const ctx = canvas.getContext("2d");
   ctx.scale(scale, scale);
 
-  ctx.fillStyle = "#f3f1ec";
+  // tema gelap flat (bukan lagi kartu terang bulat gede per meja) - kursi
+  // langsung "mengambang" di atas latar gelap, cuma lingkaran tengah
+  // (hitam pekat) yg jadi penanda meja, spy kontras warna kursi lebih
+  // menonjol & tidak keliatan penuh/silau spt versi kartu putih sebelumnya
+  const BG = "#1a1b1e";
+  ctx.fillStyle = BG;
   ctx.fillRect(0, 0, canvasW, canvasH);
 
   ctx.textBaseline = "alphabetic";
   ctx.textAlign = "left";
-  ctx.fillStyle = "#1a1a18";
+  ctx.fillStyle = "#f0efec";
   ctx.font = "bold 20px Arial, sans-serif";
   ctx.fillText(D().event || "", PAD, PAD + 8);
   ctx.font = "13px Arial, sans-serif";
-  ctx.fillStyle = "#6b6860";
+  ctx.fillStyle = "#a3a39d";
   const dateStr = D().date
     ? new Date(D().date + "T00:00:00").toLocaleDateString(lang === "id" ? "id-ID" : "en-GB", { day: "numeric", month: "long", year: "numeric" })
     : "";
   ctx.fillText(`${dateStr}${dateStr ? " · " : ""}${t("updatedAt")} ${new Date().toLocaleString(lang === "id" ? "id-ID" : "en-GB")}`, PAD, PAD + 26);
 
   const stageY = PAD + TITLE_H;
-  const grad = ctx.createLinearGradient(0, stageY, 0, stageY + STAGE_H);
-  grad.addColorStop(0, "#2c2e33");
-  grad.addColorStop(1, "#111214");
-  ctx.fillStyle = grad;
+  ctx.fillStyle = "#000000";
   roundRectPath(ctx, PAD, stageY, contentW, STAGE_H, 10);
   ctx.fill();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  roundRectPath(ctx, PAD, stageY, contentW, STAGE_H, 10);
+  ctx.stroke();
   ctx.fillStyle = "#ffffff";
   ctx.font = "bold 16px Arial, sans-serif";
   ctx.textAlign = "center";
@@ -4113,22 +4119,15 @@ function drawSeatMapCanvas() {
     const cy = boxY + boxH / 2;
     const r = d / 2;
 
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fillStyle = "#ffffff";
-    ctx.fill();
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = "#e2e0d9";
-    ctx.stroke();
-
+    // lingkaran tengah pekat (bukan latar bulat besar spt sebelumnya) -
+    // cuma penanda posisi meja & nomornya, kursi mengambang bebas di
+    // sekelilingnya di atas latar gelap
     const centerR = r * 0.48;
     ctx.beginPath();
     ctx.arc(cx, cy, centerR, 0, Math.PI * 2);
-    ctx.fillStyle = "#eeece6";
+    ctx.fillStyle = "#000000";
     ctx.fill();
-    ctx.strokeStyle = "#e2e0d9";
-    ctx.stroke();
-    ctx.fillStyle = "#1a1a18";
+    ctx.fillStyle = "#f0efec";
     ctx.font = `bold ${Math.max(11, Math.round(centerR * 0.5))}px Arial, sans-serif`;
     ctx.fillText(tb.locked ? "🔒" : tableLabel(tb), cx, cy);
 
@@ -4145,9 +4144,6 @@ function drawSeatMapCanvas() {
       ctx.arc(sx, sy, dotSize, 0, Math.PI * 2);
       ctx.fillStyle = v.fill;
       ctx.fill();
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = v.stroke;
-      ctx.stroke();
       ctx.fillStyle = v.text;
       ctx.font = `bold ${Math.max(7, Math.round(dotSize * 0.9))}px Arial, sans-serif`;
       ctx.fillText(seatLetter(i), sx, sy);
@@ -4174,9 +4170,7 @@ function drawSeatMapCanvas() {
     ctx.arc(lx + dotR, legendY, dotR, 0, Math.PI * 2);
     ctx.fillStyle = v.fill;
     ctx.fill();
-    ctx.strokeStyle = v.stroke;
-    ctx.stroke();
-    ctx.fillStyle = "#3a3833";
+    ctx.fillStyle = "#d0cfc9";
     ctx.fillText(label, lx + dotR * 2 + 6, legendY + 4);
     lx += widths[i] + itemGap;
   });
